@@ -1,0 +1,467 @@
+
+<!DOCTYPE html />
+<html lang='en'>
+  <head>
+    <meta charset="UTF-8" />
+    <link rel='icon' type='image/jpg' href='icon.jpg' />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="average building enjoyer, netrunning enthusiast" />
+    <title>walking through a gotoBLAS/BLIS 8x8 sgemm kernel</title>
+    <style>
+        body {
+          width: 650px;
+          margin: auto;
+          margin-top: 15vh;
+          font-family: Consolas,Monaco,Lucida Console,Liberation Mono,DejaVu Sans Mono,Bitstream Vera Sans Mono,Courier New;
+          margin-bottom: 20vh;
+          line-height: 1.3em;
+          background-color: black;
+          color: white;
+        }
+        body pre { line-height: 1.2em; }
+        body ul li { margin-top: 10px; }
+        body a { color: dodgerblue;}
+        body .thread { color: dodgerblue; text-decoration: none;}
+        body .thread:hover { text-decoration: underline;}
+        body hr { border: 2.5px dotted white; }
+        body p:not(:nth-child(2)) { margin-top: 30px; }
+        body p:nth-child(2) { margin-top: 0px; }
+        body h3:first-child { margin-bottom: 5px; }
+        body h4 { margin-top: 30px; }
+        body h5 { margin: 0px; font-weight: 100; }
+        body table td { width: 120px; text-align: left; }
+        body table th { width: 120px; text-align: left; }
+        @media only screen and (max-width: 650px) { 
+          body { width: 90vw !important; } 
+        }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h3>[wip] walking through a gotoBLAS/BLIS 8x8 sgemm kernel</h3>
+      <br />
+      <p>for a general introduction into sgemms, check out <a href="https://siboehm.com/articles/22/Fast-MMM-on-CPU" target="_blank">this</a> and <a href="https://marek.ai/matrix-multiplication-on-cpu.html" target="_blank">this</a>. Note this is not official gotoBLAS/BLIS code. It is an 8x8 AVX256 implementation of their <a href="https://www.cs.utexas.edu/users/flame/pubs/blis3_ipdps14.pdf">paper</a>. All examples are running on ubuntu 22.04.3 and compiled with g++ 11.4.0</p>
+      <br />
+      <p>we define the following type as wrapper over AVX registers in order to access specific floats:</p>
+      <pre><code>
+        typedef union {
+          __m256 v;
+          float f[8];
+        } m256_t;</code></pre>
+      <br />
+      <h4>sgemm function</h4>
+      <p>we take in templates <i>mb</i>, <i>kb</i> as the block sizes, <i>th</i> number of threads, <i>m</i> rows of <b>a</b>, <i>n</i> columns of <b>b</b> and <i>k</i> shared size. We also take in arguments <var>a</var> and <var>b</var> as the matrices to be multiplied, <var>c</var> as the matrix to be populated and <var>lda</var>, <var>ldb</var>, <var>ldc</var> as the stride length of their respective matrices.</p>
+      <pre><code>
+
+        template &ltint mb, int kb, int th, int m, int n, int k&gt
+        void sgemm(float* a, float* b, float* c, int lda, int ldb, int ldc) {
+          // . . .
+        }
+      </code></pre>
+      <p>one of the main bottlenecks we encounter is memory bandwidth. Modern CPUs have 3 levels of sRAM, L1, L2, L3, dRAM and then disk. Memory access speeds slow down as you go down the chain and memory size shrinks as you go up. On my CPU, a Ryzen 3900X :
+      <ul>
+        <li>L1 data cache latency is 4-5 cycles with a size of 32kB per core, translating to ~8000 f32's per core, total of ~96.000.</li>
+        <li>L2 cache latency is ~12 cycles with a size of 512kB per core, translating to ~128.000 f32's per core, total of ~1.536.000</li>
+        <li>L3 cache latency is ~47 cycles with a total shared size of 64MB, translating to ~16.384.000 f32</li>
+        <li>dRAM is 47 cycles + 74ns with variable size, i have 128GB.</li> 
+      </ul>
+      Minimising slower memory use leads to a faster runtime.</p>
+      <br />
+      <details>
+        <summary>find cache info with cpuid</summary>
+        <p></p>
+        <p>in order to find cpu cache information, you can execute a cpuid instruction with <var>eax</var> set to 0x1, 0x2 on intel, and 0x800000005, 0x800000006 on amd. read more about it <a href='https://en.wikipedia.org/wiki/cpuid' target="_blank">here</a> or read the working <a href="https://github.com/gandalftea/tensorlib/blob/master/cpu_gemms.h" target="_blank">example</a> in tensorlib. to call it use inline assembly:</p>
+        <pre><code>
+        void _cpuid(long int op, uint32_t& eax, uint32_t& ebx, 
+                                 uint32_t& ecx, uint32_t& edx) {
+          asm volatile (
+              "cpuid"
+              : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+              : "a"(op)
+              : "cc" 
+          );
+        }
+        </pre></code>
+
+      </details>
+      <p>the first step is to divide the big matrices into sub-matrices of a given block size that can fit into smaller, faster memory. In <a href="https://cs.utexas.edu/users/flame/pubs/blis3_ipdps14.pdf">the BLIS paper</a>, the authors aim to keep b into L3 and a mainly in L2. Given our sRAM sizes, this does not become a problem until the mats are bigger then 4096x4096.</p>
+      <pre> <code>
+        for(int i=0; i < k; i+=kb) {
+          ib = std::min(k-i, kb);
+          for(int ii=0; ii < m; ii+mb) {
+            iib = std::min(m-ii, mb);
+            // . . . 
+          }
+        } </code> </pre>
+      <p>we split the matrices along the shared k dimension and a's m into kb x mb blocks. A 16x16 split into 8x8 blocks looks like this:</p>
+      <img src="blocking.png" style="filter: grayscale(70%);" />
+      <p>we create pointers <var>wa</var> and <var>wb</var> to point to the current block:
+      <pre><code>
+      float* wa = &a[i*k+ii];
+      float* wb = &b[i]; </code></pre>
+
+
+      <br />
+      <h4>packing</h4>
+      <p>the first sub-matrix in the image above is not contiguous in memory. To get to the second row, you need to skip 8 values. As the matrix size gets bigger, the number of elements you have to skip get larger. You start getting cache misses and TLB misses. To  avoid this, and get the benefit of contiguous memory, we pack those value into buffers.</p>
+      <p>Adding more reads and writes to optimise is counter-intuitive, but as pointed out in this <a href="https://cs.utexas.edu/users/flame/pubs/GotoTOMS_final.pdf" target="_blank"> paper</a>, <i>the cost needs not to create a substantial overhead beyond what is already exposed from the loading [...] into the L2 cache.</i></p>
+      <br />
+      <details>
+        <summary>about TLB misses and CPU halts</summary>
+        <p>TODO</p>
+      </details>
+      <p>in order to pack a, we loop over shared dimension k and unroll it by 8:</p>
+      <pre><code>
+        inline void pack_a(int k, const float* a, int lda, float* to) {
+          for(int i=0; i&ltk; i++) {
+            const float* a_ij_ptr = &a[j*lda];
+            *to     = *a_ij_ptr;
+            *(to+1) = *(a_ij_ptr+1);
+            *(to+2) = *(a_ij_ptr+2);
+            *(to+3) = *(a_ij_ptr+3);
+            *(to+4) = *(a_ij_ptr+4);
+            *(to+5) = *(a_ij_ptr+5);
+            *(to+6) = *(a_ij_ptr+6);
+            *(to+7) = *(a_ij_ptr+7);
+            to += 8;
+          }
+        } </code></pre>
+        <p>a pack of a copies the first 8 values of each row into a buffer. a pack of b copies all columns of the first 8 rows into a buffer.</p>
+        <img src="packing.png">
+        <p>because of this, we can order the elements of b column-major and skip an explicit transposition:</p>
+        <pre><code>
+          inline void pack_b(int n, const float* b, int ldb, float* to) {
+            const float *b_i0_ptr = &b[0], 
+                        *b_i1_ptr = &b[(1*ldb)], 
+                        *b_i2_ptr = &b[(2*ldb)], 
+                        *b_i3_ptr = &b[(3*ldb)], 
+                        *b_i4_ptr = &b[(4*ldb)], 
+                        *b_i5_ptr = &b[(5*ldb)], 
+                        *b_i6_ptr = &b[(6*ldb)], 
+                        *b_i7_ptr = &b[(7*ldb)];
+
+            for(i=0; i&ltn; i++) {
+              *to     = *b_i0_ptr;
+              *(to+1) = *b_i1_ptr; 
+              *(to+2) = *b_i2_ptr; 
+              *(to+3) = *b_i3_ptr; 
+              *(to+4) = *b_i4_ptr; 
+              *(to+5) = *b_i5_ptr; 
+              *(to+6) = *b_i6_ptr; 
+              *(to+7) = *b_i7_ptr; 
+              to += 8; 
+              b_i0_ptr++; b_i1_ptr++; 
+              b_i2_ptr++; b_i3_ptr++; 
+              b_i4_ptr++; b_i5_ptr++; 
+              b_i6_ptr++; b_i7_ptr++; 
+            }
+          } </code></pre>
+      <p>we can call it multiple times while incrementing the starting index by 8 for a and by 8*ldb for b and pack the whole matrices, but doing so at once would be inefficient, as we don't use all the values in one iteration of the kernel.</p>
+      <p>we allocate the packs:</p>
+      <pre><code>
+      float* pa = new alignas(32) float[ib*iib];
+      static float* pb = new alignas(32) float[iib*n]; // static is not thread safe </code></pre>
+      <p>beware the position of alignas for different compilers:<p>
+      <pre><code>
+      float* pa = new <b>alignas(32)</b> float[ib*n]; // g++
+      float* pa = new float[ib*n] <b>alignas(32)</b>; // clang </code></pre>
+      <br />
+      <br />
+      <h4>inner kernel</h4>
+      <p>we're blocking the matrices into sub-matrices, now we need to split the sub-matrices into 8x8 blocks to pass them into the kernel.</p>
+      <pre><code>
+      for(int iii=0; iii&ltn; iii+=8) {
+        if(ii==0) pack_b(ib, &wb[iii*n], n, &pb[iii*ib]);
+        for(int iiii=0; iiii&ltiib; iiii+=8) {
+          if(iii==0) pack_a(ib, &wa[iiii], k, &pa[iiii*ib]);
+
+          // 8x8 kernel . . . 
+        }
+      } </code></pre>
+      <p>consider a 32x32 matrix with 16x16 blocks updated by the 8x8 kernel. one single run of the kernel updates an 8x8 panel of c:</p>
+      <img src="fill0.png" style="width: 100%;"/>
+      <p>running the iiii loop iterates the 8x8 kernel over the columns of c until it reaches the block size. in the image below, the kernel ran 2 times equaling a 16x8 panel of c being updated:</p>
+      <img src="fill1.png" style="width: 100%;"/>
+      <p> at the same time, we have filled <var>pa</var> with all the values of the first 16x16 block. Each run of the iiii loop first packs the relevant 8x16 of <var>a</var> then passes the packed values into the kernel. The entire pack of a is shown below, with each element's value equal to it's index in a:</a></p>
+      <br />
+      <img src="pack_a_0.png" style="width: 100%;" />
+      <img src="pack_a_1.png" style="width: 100%;" />
+      <p>running the iii loop iterates the 16x8 panel over all rows of c, updating a 16x<var>m</var> panel of c. in this case, it happens to be half:</p>
+      <img src="fill2.png" style="width: 100%;"/>
+      <p>while this loop runs, we also fill <var>pb</var> in the same manner:</p>
+      <img src="pack_b.png" style="width: 100%;" />
+      <p>the ii loop completes the first run over c in panels of 16x<var>m</var>:</p>
+      <img src="fill3.png" style="width: 100%;" />
+      <p>for every iteration of this loop, we change the packed values of <var>a</var>. The next ones are:</p>
+      <img src="pack_a_2.png" style="width: 100%;" />
+      <p>finally, the i loop compounts all values of c to their correct end value. For every iteration of this loop, we change the packed values of b. This is the next pack:</p>
+      <p>img of pb</p>
+      <p>putting it all together, the 4 loops behave like this:</p>
+      <pre><code>
+        for each 8 values in the length of the shared dimension: // compound values
+          pack current block of b
+          for each 8 values in the length of rows of a: // updates block x n until m 
+            pack current half-block of a
+            for each row of c:  // updates block x height of c
+              for each 8x8 values from 0 to block size: // updates 8xblock
+                update 8x8
+      </code></pre>
+
+      <br />
+      <h4>8x8 kernel</h4>
+      <p>the rest is easy, we only concern ourselves with the contigous packs of a and b and pick 8 values at a time from both to multiply</p>
+      <p>we define workin pointers <var>wpa</var> and <var>wpb</var> into their respective packs. notice the index is the same as the beginning of the current sub-block moved in the same loop. <var>wc</var> points to the beginning of the 8x8 panel we will update in c.</p>
+      <pre><code>
+        float* wpa = &pa[iiii*ib];
+        float* wpb = &pb[iii*ib];
+        float* wc = &c[ii+iii*n+iiii]; </code></pre>
+      <p>we also define 8 __m256 registers to hold the 64 computed values of c, alongside two registers pointing to the data in the packs.</p>
+      <pre><code>
+        m256_t c0007, c1017, c2027, c3037,
+               c4047, c5057, c6067, c7077,
+               a_vreg, b_p0_vreg; </code></pre>
+      <p>set all elements of the <var>c</var> registers to 0:</p>
+      <pre><code>
+        c0007.v = _mm256_setzero_ps();
+        c1017.v = _mm256_setzero_ps();
+        c2027.v = _mm256_setzero_ps();
+        c3037.v = _mm256_setzero_ps();
+        c4047.v = _mm256_setzero_ps();
+        c5057.v = _mm256_setzero_ps();
+        c6067.v = _mm256_setzero_ps();
+        c7077.v = _mm256_setzero_ps();</code></pre>
+      <p>if we don't do this, they keep their values into the next loop. we also cannot do this at the end of the loop, because the compiler optimises it out.</p>
+      <p>next we iterate through the 8x<i>ib</i> panel we packed before, reading 8 values of <var>pa</var> into <var>a_vreg</var> and 8 values of <var>pb</var> into <var>b_p0_vreg</var>, incrementing the pointers afterwards:</p>
+      <pre><code>
+        for(iiiii=0; iiiii&ltiib; iiiii++) {
+          __builtin_prefetch(wpa+8);
+          __builtin_prefetch(wpb+8);
+
+          a_vreg.v = _mm256_load_ps( (float*) wpa );
+          wpa += 8;
+
+          b_p0_vreg.v = _mm256_load_ps( (float*) wpb);
+          wpb += 8;
+
+          c0007.v += a_vreg.v * b_p0_vreg.f[0];
+          c1017.v += a_vreg.v * b_p0_vreg.f[1];
+          c2027.v += a_vreg.v * b_p0_vreg.f[2];
+          c3037.v += a_vreg.v * b_p0_vreg.f[3];
+          c4047.v += a_vreg.v * b_p0_vreg.f[4];
+          c5057.v += a_vreg.v * b_p0_vreg.f[5];
+          c6067.v += a_vreg.v * b_p0_vreg.f[6];
+          c7077.v += a_vreg.v * b_p0_vreg.f[7];
+        }</code></pre>
+      <p>we multiply all the 8 values of <var>a_vreg</var> with one single value of <var>b_p0_vreg</var> and accumulate it in the c registers.</p> 
+      <p>notice we don't explicitly call <var>_mm256_fmadd_ps</var>. This is because both of the arguments would need to be <var>__mm256</var> registers. the code would look like this:</p>
+      <pre><code>
+        m256_t b0, b1, b2, b3, b4, b5, b6, b7;
+
+        b0.v = _mm256_broadcast_ss( (float*) &wpa[0] );
+        b1.v = _mm256_broadcast_ss( (float*) &wpa[1] );
+        b2.v = _mm256_broadcast_ss( (float*) &wpa[2] );
+        b3.v = _mm256_broadcast_ss( (float*) &wpa[3] );
+        b4.v = _mm256_broadcast_ss( (float*) &wpa[4] );
+        b5.v = _mm256_broadcast_ss( (float*) &wpa[5] );
+        b6.v = _mm256_broadcast_ss( (float*) &wpa[6] );
+        b7.v = _mm256_broadcast_ss( (float*) &wpa[7] );
+
+        c0007.v = _mm256_fmadd_ps(a_vreg.v, b0.v, c0007.v);
+        c1017.v = _mm256_fmadd_ps(a_vreg.v, b1.v, c1017.v);
+        c2027.v = _mm256_fmadd_ps(a_vreg.v, b2.v, c2027.v);
+        c3037.v = _mm256_fmadd_ps(a_vreg.v, b3.v, c3037.v);
+        c4047.v = _mm256_fmadd_ps(a_vreg.v, b4.v, c4047.v);
+        c5057.v = _mm256_fmadd_ps(a_vreg.v, b5.v, c5057.v);
+        c6067.v = _mm256_fmadd_ps(a_vreg.v, b6.v, c6067.v);
+        c7077.v = _mm256_fmadd_ps(a_vreg.v, b7.v, c7077.v); </code></pre>
+      <p>we use <var>_mm256_broadcast_ss</var> to fill the <var>b*</var> registers with the relevant float of <var>b</var> and then perform <var>_mm256_fmadd_ps</var>, multiplying <var>a_vreg</var> with <var>b*</var> register and adding the previous value of the relevant c register</p>
+      <p>in theory, this is the most efficient way to do this. in practice, we already use 9 ymm registers allocated by our previous declaration of the __m256 types:</p>
+      <pre><code> 
+        m256_t c0007, c1017, c2027, c3037,
+               c4047, c5057, c6067, c7077,
+               a_vreg; </code></pre>
+      <p>with the addition of another 8, this puts us at 17. my processor, similar to a lot of modern processors, only has 16 physical ymm registers on the chip. explicitly defining the 8 <var>b</var> registers would introduce a lot of data movement in the part of the code that runs the most, forcing it to allocate and dealocate ymm registers to new values.</p>
+      <p>taking a look at the compiled object files lets us see that the behaviour of both solutions is very similar. the compiler uses <var>_mm256_broadcast_ss</var> and <var>_mm256_fmadd_ps</var> anyway:</p>
+      <p>inner kernel loop with <var>_mm256_broadcast_ss</var> call:</p>
+      <pre><code>
+        1a30:	c5 fc 28 00          	vmovaps (%rax),%ymm0
+        1a34:	48 83 c0 20          	add    $0x20,%rax
+        1a38:	49 83 c0 20          	add    $0x20,%r8
+        1a3c:	c4 62 7d 18 70 04    	vbroadcastss 0x4(%rax),%ymm14
+        1a42:	c4 62 7d 18 38       	vbroadcastss (%rax),%ymm15
+        1a47:	0f 18 08             	prefetcht0 (%rax)
+        1a4a:	41 0f 18 08          	prefetcht0 (%r8)
+        1a4e:	c4 62 7d a8 b4 24 20 	vfmadd213ps 0x120(%rsp),%ymm0,%ymm14
+        1a55:	01 00 00 
+        1a58:	c4 62 7d 18 68 08    	vbroadcastss 0x8(%rax),%ymm13
+        1a5e:	c4 62 7d 18 60 0c    	vbroadcastss 0xc(%rax),%ymm12
+        1a64:	c4 62 7d 18 58 10    	vbroadcastss 0x10(%rax),%ymm11
+        1a6a:	c4 62 7d 18 50 14    	vbroadcastss 0x14(%rax),%ymm10
+        1a70:	c4 62 7d 18 48 18    	vbroadcastss 0x18(%rax),%ymm9
+        1a76:	c4 e2 7d 18 48 1c    	vbroadcastss 0x1c(%rax),%ymm1
+        1a7c:	c4 42 7d b8 c7       	vfmadd231ps %ymm15,%ymm0,%ymm8
+        1a81:	c4 c2 7d b8 d5       	vfmadd231ps %ymm13,%ymm0,%ymm2
+        1a86:	c4 c2 7d b8 dc       	vfmadd231ps %ymm12,%ymm0,%ymm3
+        1a8b:	c4 c2 7d b8 e3       	vfmadd231ps %ymm11,%ymm0,%ymm4
+        1a90:	c4 c2 7d b8 ea       	vfmadd231ps %ymm10,%ymm0,%ymm5
+        1a95:	c4 c2 7d b8 f1       	vfmadd231ps %ymm9,%ymm0,%ymm6
+        1a9a:	c4 e2 7d b8 f9       	vfmadd231ps %ymm1,%ymm0,%ymm7
+        1a9f:	c5 7c 29 b4 24 20 01 	vmovaps %ymm14,0x120(%rsp)
+        1aa6:	00 00 
+        1aa8:	48 39 f8             	cmp    %rdi,%rax
+        1aab:	75 83                	jne    1a30 <_Z5sgemm . . . >
+      </code></pre>
+      <p>inner kernel loop without broadcast:</p>
+      <pre><code>
+        1a00:	c4 c1 7c 28 00       	vmovaps (%r8),%ymm0
+        1a05:	c5 fc 28 08          	vmovaps (%rax),%ymm1
+        1a09:	49 83 c0 20          	add    $0x20,%r8
+        1a0d:	48 83 c0 20          	add    $0x20,%rax
+        1a11:	0f 18 08             	prefetcht0 (%rax)
+        1a14:	41 0f 18 08          	prefetcht0 (%r8)
+        1a18:	c4 e2 7d 18 c0       	vbroadcastss %xmm0,%ymm0
+        1a1d:	c4 e2 75 b8 d0       	vfmadd231ps %ymm0,%ymm1,%ymm2
+        1a22:	c4 c2 7d 18 40 e4    	vbroadcastss -0x1c(%r8),%ymm0
+        1a28:	c4 e2 75 b8 d8       	vfmadd231ps %ymm0,%ymm1,%ymm3
+        1a2d:	c4 c2 7d 18 40 e8    	vbroadcastss -0x18(%r8),%ymm0
+        1a33:	c4 e2 75 b8 e0       	vfmadd231ps %ymm0,%ymm1,%ymm4
+        1a38:	c4 c2 7d 18 40 ec    	vbroadcastss -0x14(%r8),%ymm0
+        1a3e:	c4 e2 75 b8 e8       	vfmadd231ps %ymm0,%ymm1,%ymm5
+        1a43:	c4 c2 7d 18 40 f0    	vbroadcastss -0x10(%r8),%ymm0
+        1a49:	c4 e2 75 b8 f0       	vfmadd231ps %ymm0,%ymm1,%ymm6
+        1a4e:	c4 c2 7d 18 40 f4    	vbroadcastss -0xc(%r8),%ymm0
+        1a54:	c4 e2 75 b8 f8       	vfmadd231ps %ymm0,%ymm1,%ymm7
+        1a59:	c4 c2 7d 18 40 f8    	vbroadcastss -0x8(%r8),%ymm0
+        1a5f:	c4 62 75 b8 c0       	vfmadd231ps %ymm0,%ymm1,%ymm8
+        1a64:	c4 c2 7d 18 40 fc    	vbroadcastss -0x4(%r8),%ymm0
+        1a6a:	c4 62 75 b8 c8       	vfmadd231ps %ymm0,%ymm1,%ymm9
+        1a6f:	48 39 f8             	cmp    %rdi,%rax
+        1a72:	75 8c                	jne    1a00 <_Z5sgemm . . . >
+      </pre></code>
+
+      <p>we only end up using one register, <var>ymm0</var> to broadcast the values of b. this is good because we never intended to reuse the allocated <var>b*</var> registers again.</p>
+
+      <details>
+        <summary>understanding the assembly</summary>
+        <p>TODO (honestly, skill issue lol)</p>
+      </details>
+
+      <p>lastly we just have to update <var>c</var>. Because we are out of the innermost loop, we are ok with realocating <i>ymm</i> registers. We define 8 <i>__m256</i> registers to hold the previous values stored in <var>c</var> and load:</p>
+      <pre><code>
+        m256_t w0, w1, w2, w3, w4, w5, w6, w7;
+
+        w0.v = _mm256_load_ps((float*)&wc[0*ldc]);
+        w1.v = _mm256_load_ps((float*)&wc[1*ldc]);
+        w2.v = _mm256_load_ps((float*)&wc[2*ldc]);
+        w3.v = _mm256_load_ps((float*)&wc[3*ldc]);
+        w4.v = _mm256_load_ps((float*)&wc[4*ldc]);
+        w5.v = _mm256_load_ps((float*)&wc[5*ldc]);
+        w6.v = _mm256_load_ps((float*)&wc[6*ldc]);
+        w7.v = _mm256_load_ps((float*)&wc[7*ldc]);
+      </pre></code>
+
+      <p>then, we add the newly computed values to the old values using <var>_mm256_add_ps</var> and store them again at the same location in <var>c</var>:</p>
+      <pre><code>
+        c0007.v = _mm256_add_ps(c0007.v, w0.v);
+        c1017.v = _mm256_add_ps(c1017.v, w1.v);
+        c2027.v = _mm256_add_ps(c2027.v, w2.v);
+        c3037.v = _mm256_add_ps(c3037.v, w3.v);
+        c4047.v = _mm256_add_ps(c4047.v, w4.v);
+        c5057.v = _mm256_add_ps(c5057.v, w5.v);
+        c6067.v = _mm256_add_ps(c6067.v, w6.v);
+        c7077.v = _mm256_add_ps(c7077.v, w7.v);
+
+        _mm256_store_ps( &wc[0*ldc], c0007.v);
+        _mm256_store_ps( &wc[1*ldc], c1017.v);
+        _mm256_store_ps( &wc[2*ldc], c2027.v);
+        _mm256_store_ps( &wc[3*ldc], c3037.v);
+        _mm256_store_ps( &wc[4*ldc], c4047.v);
+        _mm256_store_ps( &wc[5*ldc], c5057.v);
+        _mm256_store_ps( &wc[6*ldc], c6067.v);
+        _mm256_store_ps( &wc[7*ldc], c7077.v);
+      </pre></code>
+      <p><var>_mm256_store_ps</var>, just like <var>_m256_load_ps</var> works on the 8 32-bit values following the starting pointer. We end up reading and updating 64 values in an 8x8 panel of <var>c</var>.</p>
+      <br />
+      <h4>performance</h4>
+      <p>running on ubuntu 22.04.3 and compiled with g++ 11.4.0<br />
+      CPU: Ryzen 9 3900X 12 core, 4.6 GHz <br />DRAM: 128 GB 3200 MHz</p>
+      <table>
+        <tr>
+          <th>N</th>
+          <th>block</th>
+          <th>threads</th>
+          <th>iterations</th>
+          <th>runtime</th>
+          <th>GFLOPS</th>
+        </tr>
+        <tr>
+          <td>512</td>
+          <td>64</td>
+          <td>12</td>
+          <td>1000</td>
+          <td>1.11ms</td>
+          <td>241.30</td>
+        </tr>
+        <tr>
+          <td>1024</td>
+          <td>128</td>
+          <td>12</td>
+          <td>1000</td>
+          <td>5.34ms</td>
+          <td>401.89</td>
+        </tr>
+        <tr>
+          <td>2048</td>
+          <td>256</td>
+          <td>12</td>
+          <td>1000</td>
+          <td>33.27ms</td>
+          <td>516.12</td>
+        </tr>
+        <tr>
+          <td>4096</td>
+          <td>512</td>
+          <td>12</td>
+          <td>100</td>
+          <td>222.39ms</td>
+          <td>618.00</td>
+        </tr>
+        <tr>
+          <td>8192</td>
+          <td>1024</td>
+          <td>12</td>
+          <td>10</td>
+          <td>1664.49ms</td>
+          <td>660.59</td>
+        </tr>
+      </table>
+      <p>single threaded performance:</p>
+      <table>
+        <tr>
+          <th>N</th>
+          <th>block</th>
+          <th>threads</th>
+          <th>iterations</th>
+          <th>runtime</th>
+          <th>GFLOPS</th>
+        </tr>
+        <tr>
+          <td>1024</td>
+          <td>128</td>
+          <td>1</td>
+          <td>1000</td>
+          <td>27.52ms</td>
+          <td>78.02</td>
+        </tr>
+      </table>
+      <br />
+      <h4>extra: transposition</h4>
+      <p>because the packing we do does not add any substancial overhead, starting out with a transposed <var>b</var> would not improve the runtime. Quite the oposite, the added runtime of the transposition kernel ends up costing us ~1-2ms for N=1024.
+      <br />
+      <br />
+      <h4>notes</h4>
+      <p>DM <a href=''>@riemannianmani</a> for any corrections, discussions, etc.
+      <p>if you found any of this useful, please consider superchatting Hololive's <a href="">Tokoyami Towa</a>-sama.</p>
+    </main>
+  </body>
+</html>
