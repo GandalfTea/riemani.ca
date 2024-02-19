@@ -31,6 +31,8 @@
         body h5 { margin: 0px; font-weight: 100; }
         body table td { width: 120px; text-align: left; }
         body table th { width: 120px; text-align: left; }
+        body .cache td { width: 150px; }
+        body .cache th { width: 150px; }
         @media only screen and (max-width: 650px) { 
           body { width: 90vw !important; } 
         }
@@ -50,25 +52,29 @@
         } m256_t;</code></pre>
       <br />
       <h4>sgemm function</h4>
-      <p>we take in templates <i>mb</i>, <i>kb</i> as the block sizes, <i>th</i> number of threads, <i>m</i> rows of <b>a</b>, <i>n</i> columns of <b>b</b> and <i>k</i> shared size. We also take in arguments <var>a</var> and <var>b</var> as the matrices to be multiplied, <var>c</var> as the matrix to be populated and <var>lda</var>, <var>ldb</var>, <var>ldc</var> as the stride length of their respective matrices.</p>
+      <p>we take in templates <i>mb</i>, <i>kb</i> as the block sizes, <i>th</i> number of threads, <i>m</i> rows of <b>a</b>, <i>n</i> columns of <b>b</b> and <i>k</i> shared dimension. We also take in arguments <var>a</var> and <var>b</var> as the matrices to be multiplied, <var>c</var> as the matrix to be populated and <var>lda</var>, <var>ldb</var>, <var>ldc</var> as the stride length of their respective matrices:</p>
       <pre><code>
-
         template &ltint mb, int kb, int th, int m, int n, int k&gt
         void sgemm(float* a, float* b, float* c, int lda, int ldb, int ldc) {
           // . . .
         }
       </code></pre>
-      <p>one of the main bottlenecks we encounter is memory bandwidth. Modern CPUs have 3 levels of sRAM, L1, L2, L3, dRAM and then disk. Memory access speeds slow down as you go down the chain and memory size shrinks as you go up. On my CPU, a Ryzen 3900X :
-      <ul>
-        <li>L1 data cache latency is 4-5 cycles with a size of 32kB per core, translating to ~8000 f32's per core, total of ~96.000.</li>
-        <li>L2 cache latency is ~12 cycles with a size of 512kB per core, translating to ~128.000 f32's per core, total of ~1.536.000</li>
-        <li>L3 cache latency is ~47 cycles with a total shared size of 64MB, translating to ~16.384.000 f32</li>
-        <li>dRAM is 47 cycles + 74ns with variable size, i have 128GB.</li> 
-      </ul>
-      Minimising slower memory use leads to a faster runtime.</p>
+      <br />
+      <h4>blocking</h4>
+      <p>one of the main bottlenecks we encounter is memory bandwidth. Modern CPUs have 3 levels of SRAM, L1, L2, L3, DRAM and then disk. Memory access speeds slow down as you go down the chain and memory size shrinks as you go up. On my CPU, a ryzen 3900X :
+      <p> <table class="cache">
+        <tr> <th>memory</th> <th>latency</th> <th>associativity</th> <th>size</th> <th>f32</th> </tr>
+        <tr> <td>L1</td> <td>~4 cycles</td> <td>8-way</td> <td>32kB /core</td> <td>~8000 /c</td> </tr>
+        <tr> <td>L2</td> <td>~12 cycles</td> <td>8-way</td> <td>512kB /core</td> <td>~128.000 /c</td> </tr>
+        <tr> <td>L3</td> <td>~47 cycles</td> <td>16-way</td> <td>64MB shared</td> <td>~1.536.000</td> </tr>
+        <tr> <td>DRAM</td> <td>~47c+74ns</td> <td>~</td> <td>~</td> <td>~</td> </tr>
+        <tr> <td>NVMe</td> <td>~25.000ns</td> <td>~</td> <td>~</td> <td>~</td> </tr>
+        <tr> <td>SATA</td> <td>~100.000ns</td> <td>~</td> <td>~</td> <td>~</td> </tr>
+      </table> </p>
+      <p>Minimising slower memory use leads to a faster runtime.</p>
       <br />
       <details>
-        <summary>find cache info with cpuid</summary>
+        <summary>cpuid cache information</summary>
         <p></p>
         <p>in order to find cpu cache information, you can execute a cpuid instruction with <var>eax</var> set to 0x1, 0x2 on intel, and 0x800000005, 0x800000006 on amd. read more about it <a href='https://en.wikipedia.org/wiki/cpuid' target="_blank">here</a> or read the working <a href="https://github.com/gandalftea/tensorlib/blob/master/cpu_gemms.h" target="_blank">example</a> in tensorlib. to call it use inline assembly:</p>
         <pre><code>
@@ -84,12 +90,13 @@
         </pre></code>
 
       </details>
-      <p>the first step is to divide the big matrices into sub-matrices of a given block size that can fit into smaller, faster memory. In <a href="https://cs.utexas.edu/users/flame/pubs/blis3_ipdps14.pdf">the BLIS paper</a>, the authors aim to keep b into L3 and a mainly in L2. Given our sRAM sizes, this does not become a problem until the mats are bigger then 4096x4096.</p>
+      <p>the first step is to divide the big matrices into sub-matrices of a given block size that can fit into smaller, faster memory. In <a href="https://cs.utexas.edu/users/flame/pubs/blis3_ipdps14.pdf">the BLIS paper</a>, the authors aim to keep <var>b</var> in L3 and <var>a</var> mainly in L2. Given our sRAM sizes, this does not become a problem until the mats are bigger then 4096x4096.</p>
       <pre> <code>
-        for(int i=0; i < k; i+=kb) {
-          ib = std::min(k-i, kb);
-          for(int ii=0; ii < m; ii+mb) {
-            iib = std::min(m-ii, mb);
+        for(int i=0; i&ltk; i+=kb) {
+          int ib = std::min(k-i, kb);
+          for(int ii=0; ii&ltm; ii+mb) {
+            int iib = std::min(m-ii, mb);
+
             // . . . 
           }
         } </code> </pre>
@@ -97,7 +104,7 @@
       <img src="blocking.png" style="filter: grayscale(70%);" />
       <p>we create pointers <var>wa</var> and <var>wb</var> to point to the current block:
       <pre><code>
-      float* wa = &a[i*k+ii];
+      float* wa = &a[i*lda+ii];
       float* wb = &b[i]; </code></pre>
 
 
@@ -167,7 +174,7 @@
       float* pa = new float[ib*n] <b>alignas(32)</b>; // clang </code></pre>
       <br />
       <br />
-      <h4>inner kernel</h4>
+      <h4>kernel control flow</h4>
       <p>we're blocking the matrices into sub-matrices, now we need to split the sub-matrices into 8x8 blocks to pass them into the kernel.</p>
       <pre><code>
       for(int iii=0; iii&ltn; iii+=8) {
@@ -194,8 +201,7 @@
       <img src="fill3.png" style="width: 100%;" />
       <p>for every iteration of this loop, we change the packed values of <var>a</var>. The next ones are:</p>
       <img src="pack_a_2.png" style="width: 100%;" />
-      <p>finally, the i loop compounts all values of c to their correct end value. For every iteration of this loop, we change the packed values of b. This is the next pack:</p>
-      <p>img of pb</p>
+      <p>finally, the i loop compounts all values of c to their correct end value. For every iteration of this loop, we change the packed values of b.</p>
       <p>putting it all together, the 4 loops behave like this:</p>
       <pre><code>
         for each 8 values in the length of the shared dimension: // compound values
@@ -291,7 +297,7 @@
         1a42:	c4 62 7d 18 38       	vbroadcastss (%rax),%ymm15
         1a47:	0f 18 08             	prefetcht0 (%rax)
         1a4a:	41 0f 18 08          	prefetcht0 (%r8)
-        1a4e:	c4 62 7d a8 b4 24 20 	vfmadd213ps 0x120(%rsp),%ymm0,%ymm14
+        <b>1a4e:	c4 62 7d a8 b4 24 20 	vfmadd213ps 0x120(%rsp),%ymm0,%ymm14</b>
         1a55:	01 00 00 
         1a58:	c4 62 7d 18 68 08    	vbroadcastss 0x8(%rax),%ymm13
         1a5e:	c4 62 7d 18 60 0c    	vbroadcastss 0xc(%rax),%ymm12
