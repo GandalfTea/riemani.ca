@@ -108,9 +108,9 @@
       float* wb = &b[i]; 
       float* tc = &c[ii];</code></pre>
 			<p>consider <var>a</var>, <var>b</var>, <var>c</var> to be 32x32 matrices and <var>kb</var> and <var>mb</var> to be 8. <var>b</var> and <var>c</var> are split into column panels of sizes <var>kb</var> x <var>k</var> (8x32) and <var>mb</var> x <var>n</var> (8x32) starting at index <var>&b[i]</var> and <var>&c[ii]</var> respectively: </p>
-      <img src="packing_cb.png" style="filter: grayscale(100%); width: 100%;" />
+      <img src="block_cb.png" style="filter: grayscale(100%); width: 100%;" />
 			<p><var>a</var> is split into <var>kb</var> x <var>mb</var> (8x8) blocks starting at row <var>i</var> and column <var>ii</var>:</p>
-      <img src="packing_a.png" style="filter: grayscale(100%); width: 100%;" />
+      <img src="block_a.png" style="filter: grayscale(100%); width: 100%;" />
 
 
       <br />
@@ -143,11 +143,14 @@
             to += 8;
           }
         } </code></pre>
-			<p>consider that the block size is now 16 and below are the first 16x16 values of each block. A pack call of <var>a</var> copies the first 8 values of each row of the block into a buffer. A pack call of <var>b</var> copies all columns of the first 8 rows of the block into a buffer.</p>
-        <img src="packing.png" style="width: 100%;" />
+			<p>consider that the block size is now 16 and below is the block of <var>a</var>. A call to <var>pack_a</var> copies the first 8 values of each row of the block into a buffer:</p> 
+
+      <img src="pack_a.png" style="width: 100%;" />
+      <p>below are the first 16 rows of the block of <var>b</var>. A call to <var>pack_b</var> copies all columns of the first 8 rows of the block into a buffer:</p>
+      <img src="packing_b.png" style="width: 100%;" />
         <p>because of this, we can order the elements of b column-major and skip an explicit transposition:</p>
         <pre><code>
-          inline void pack_b(int n, const float* b, int ldb, float* to) {
+          inline void pack_b(int ib, const float* b, int ldb, float* to) {
             const float *b_i0_ptr = &b[0], 
                         *b_i1_ptr = &b[(1*ldb)], 
                         *b_i2_ptr = &b[(2*ldb)], 
@@ -157,7 +160,7 @@
                         *b_i6_ptr = &b[(6*ldb)], 
                         *b_i7_ptr = &b[(7*ldb)];
 
-            for(i=0; i&ltn; i++) {
+            for(i=0; i&ltib; i++) {
               *to     = *b_i0_ptr;
               *(to+1) = *b_i1_ptr; 
               *(to+2) = *b_i2_ptr; 
@@ -193,19 +196,19 @@
         }
       } </code></pre>
       <p>consider a 32x32 matrix with 16x16 blocks updated by the 8x8 kernel. one single run of the kernel updates an 8x8 panel of c:</p>
-      <img src="fill0.png" style="width: 100%;"/>
+      <img src="fill_0.png" style="width: 100%;"/>
       <p>running the iiii loop iterates the 8x8 kernel over the columns of c until it reaches the block size. in the image below, the kernel ran 2 times equaling a 16x8 panel of c being updated:</p>
-      <img src="fill1.png" style="width: 100%;"/>
+      <img src="fill_1.png" style="width: 100%;"/>
       <p> at the same time, we have filled <var>pa</var> with all the values of the first 16x16 block. Each run of the iiii loop first packs the relevant 8x16 of <var>a</var> then passes the packed values into the kernel. The entire pack of a is shown below, with each element's value equal to it's index in a:</a></p>
       <br />
       <img src="pack_a_0.png" style="width: 100%;" />
       <img src="pack_a_1.png" style="width: 100%;" />
       <p>running the iii loop iterates the 16x8 panel over all rows of c, updating a 16x<var>m</var> panel of c. in this case, it happens to be half:</p>
-      <img src="fill2.png" style="width: 100%;"/>
+      <img src="fill_2.png" style="width: 100%;"/>
       <p>while this loop runs, we also fill <var>pb</var> in the same manner:</p>
       <img src="pack_b.png" style="width: 100%;" />
       <p>the ii loop completes the first run over c in panels of 16x<var>m</var>:</p>
-      <img src="fill3.png" style="width: 100%;" />
+      <img src="fill_3.png" style="width: 100%;" />
       <p>for every iteration of this loop, we change the packed values of <var>a</var>. The next ones are:</p>
       <img src="pack_a_2.png" style="width: 100%;" />
       <p>finally, the i loop compounts all values of c to their correct end value. For every iteration of this loop, we change the packed values of b.</p>
