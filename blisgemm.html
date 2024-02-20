@@ -108,9 +108,9 @@
       float* wb = &b[i]; 
       float* tc = &c[ii];</code></pre>
 			<p>consider <var>a</var>, <var>b</var>, <var>c</var> to be 32x32 matrices and <var>kb</var> and <var>mb</var> to be 8. <var>b</var> and <var>c</var> are split into column panels of sizes <var>kb</var> x <var>k</var> (8x32) and <var>mb</var> x <var>n</var> (8x32) starting at index <var>&b[i]</var> and <var>&c[ii]</var> respectively: </p>
-      <img src="block_cb.png" style="filter: grayscale(100%); width: 100%;" />
+      <img src="packing_cb.png" style="filter: grayscale(100%); width: 100%;" />
 			<p><var>a</var> is split into <var>kb</var> x <var>mb</var> (8x8) blocks starting at row <var>i</var> and column <var>ii</var>:</p>
-      <img src="block_a.png" style="filter: grayscale(100%); width: 100%;" />
+      <img src="packing_a.png" style="filter: grayscale(100%); width: 100%;" />
 
 
       <br />
