@@ -51,7 +51,8 @@
           float f[8];
         } m256_t;</code></pre>
       <br />
-      <h4>sgemm function</h4>
+      <br />
+      <h3>function</h3>
       <p>we take in templates <i>mb</i>, <i>kb</i> as the block sizes, <i>th</i> number of threads, <i>m</i> rows of <b>a</b>, <i>n</i> columns of <b>b</b> and <i>k</i> shared dimension. We also take in arguments <var>a</var> and <var>b</var> as the matrices to be multiplied, <var>c</var> as the matrix to be populated and <var>lda</var>, <var>ldb</var>, <var>ldc</var> as the stride length of their respective matrices:</p>
       <pre><code>
         template &ltint mb, int kb, int th, int m, int n, int k&gt
@@ -60,7 +61,8 @@
         }
       </code></pre>
       <br />
-      <h4>blocking</h4>
+      <br />
+      <h3>blocking</h3>
       <p>one of the main bottlenecks we encounter is memory bandwidth. Modern CPUs have 3 levels of SRAM, L1, L2, L3, DRAM and then disk. Memory access speeds slow down as you go down the chain and memory size shrinks as you go up. On my CPU, a ryzen 3900X :
       <p> <table class="cache">
         <tr> <th>memory</th> <th>latency</th> <th>associativity</th> <th>size</th> <th>f32</th> </tr>
@@ -90,7 +92,7 @@
         </pre></code>
 
       </details>
-      <p>the first step is to divide the big matrices into sub-matrices of a given block size that can fit into smaller, faster memory. In <a href="https://cs.utexas.edu/users/flame/pubs/blis3_ipdps14.pdf">the BLIS paper</a>, the authors aim to keep <var>b</var> in L3 and <var>a</var> mainly in L2. Given our sRAM sizes, this does not become a problem until the mats are bigger then 4096x4096.</p>
+      <p>the first step is to divide the big matrices into sub-matrices of a given block size that can fit into smaller, faster memory. In <a href="https://cs.utexas.edu/users/flame/pubs/blis3_ipdps14.pdf">the BLIS paper</a>, the authors aim to keep <var>b</var> in L3 and <var>a</var> mainly in L2. Given our SRAM sizes, this does not become a problem until the mats are bigger then 4096x4096.</p>
       <pre> <code>
         for(int i=0; i&ltk; i+=kb) {
           int ib = std::min(k-i, kb);
@@ -100,28 +102,36 @@
             // . . . 
           }
         } </code> </pre>
-      <p>we split the matrices along the shared k dimension and a's m into kb x mb blocks. A 16x16 split into 8x8 blocks looks like this:</p>
-      <img src="blocking.png" style="filter: grayscale(70%);" />
-      <p>we create pointers <var>wa</var> and <var>wb</var> to point to the current block:
+      <p>We create pointers <var>wa</var> and <var>wb</var> to point to the current block:
       <pre><code>
       float* wa = &a[i*lda+ii];
-      float* wb = &b[i]; </code></pre>
+      float* wb = &b[i]; 
+      float* tc = &c[ii];</code></pre>
+			<p>consider <var>a</var>, <var>b</var>, <var>c</var> to be 32x32 matrices and <var>kb</var> and <var>mb</var> to be 8. <var>b</var> and <var>c</var> are split into column panels of sizes <var>kb</var> x <var>k</var> (8x32) and <var>mb</var> x <var>n</var> (8x32) starting at index <var>&b[i]</var> and <var>&c[ii]</var> respectively: </p>
+      <img src="block_cb.png" style="filter: grayscale(100%); width: 100%;" />
+			<p><var>a</var> is split into <var>kb</var> x <var>mb</var> (8x8) blocks starting at row <var>i</var> and column <var>ii</var>:</p>
+      <img src="block_a.png" style="filter: grayscale(100%); width: 100%;" />
 
 
       <br />
-      <h4>packing</h4>
-      <p>the first sub-matrix in the image above is not contiguous in memory. To get to the second row, you need to skip 8 values. As the matrix size gets bigger, the number of elements you have to skip get larger. You start getting cache misses and TLB misses. To  avoid this, and get the benefit of contiguous memory, we pack those value into buffers.</p>
-      <p>Adding more reads and writes to optimise is counter-intuitive, but as pointed out in this <a href="https://cs.utexas.edu/users/flame/pubs/GotoTOMS_final.pdf" target="_blank"> paper</a>, <i>the cost needs not to create a substantial overhead beyond what is already exposed from the loading [...] into the L2 cache.</i></p>
       <br />
+      <br />
+      <h3>packing</h3>
+			<p>the first sub-matrix of <var>a</var> in the image above is not contiguous in memory. To get to the second row, you need to skip 24 values. As the matrix size gets bigger, the number of elements you have to skip get larger. You start getting cache misses and TLB misses. To avoid this, and get the benefit of contiguous memory, we pack the current blocks of <var>a</var> and <var>b</var> into buffers.</p>
       <details>
         <summary>about TLB misses and CPU halts</summary>
         <p>TODO</p>
       </details>
-      <p>in order to pack a, we loop over shared dimension k and unroll it by 8:</p>
+      <p>Adding more reads and writes to optimise is counter-intuitive, but as pointed out in this <a href="https://cs.utexas.edu/users/flame/pubs/GotoTOMS_final.pdf" target="_blank"> paper</a>, <i>the cost needs not to create a substantial overhead beyond what is already exposed from the loading [...] into the L2 cache.</i></p>
+      <p>we allocate the packs:</p>
       <pre><code>
-        inline void pack_a(int k, const float* a, int lda, float* to) {
-          for(int i=0; i&ltk; i++) {
-            const float* a_ij_ptr = &a[j*lda];
+      float* pa = new alignas(32) float[ib*iib];
+      static float* pb = new alignas(32) float[iib*n]; // static is not thread safe </code></pre>
+			<p>in order to pack a, we loop over block size <var>ib</var>:</p>
+      <pre><code>
+        inline void pack_a(int ib, const float* a, int lda, float* to) {
+          for(int i=0; i&ltib; i++) {
+            const float* a_ij_ptr = &a[i*lda];
             *to     = *a_ij_ptr;
             *(to+1) = *(a_ij_ptr+1);
             *(to+2) = *(a_ij_ptr+2);
@@ -133,8 +143,8 @@
             to += 8;
           }
         } </code></pre>
-        <p>a pack of a copies the first 8 values of each row into a buffer. a pack of b copies all columns of the first 8 rows into a buffer.</p>
-        <img src="packing.png">
+			<p>consider that the block size is now 16 and below are the first 16x16 values of each block. A pack call of <var>a</var> copies the first 8 values of each row of the block into a buffer. A pack call of <var>b</var> copies all columns of the first 8 rows of the block into a buffer.</p>
+        <img src="packing.png" style="width: 100%;" />
         <p>because of this, we can order the elements of b column-major and skip an explicit transposition:</p>
         <pre><code>
           inline void pack_b(int n, const float* b, int ldb, float* to) {
@@ -163,18 +173,15 @@
               b_i6_ptr++; b_i7_ptr++; 
             }
           } </code></pre>
-      <p>we can call it multiple times while incrementing the starting index by 8 for a and by 8*ldb for b and pack the whole matrices, but doing so at once would be inefficient, as we don't use all the values in one iteration of the kernel.</p>
-      <p>we allocate the packs:</p>
-      <pre><code>
-      float* pa = new alignas(32) float[ib*iib];
-      static float* pb = new alignas(32) float[iib*n]; // static is not thread safe </code></pre>
-      <p>beware the position of alignas for different compilers:<p>
+      <p>we can call it multiple times while incrementing the starting index by 8 for a and by 8*ldb for b and pack the whole blocks, but doing so at once would be inefficient, as we don't use all the values in one iteration of the kernel.</p>
+      <p>NOTE: beware the position of alignas for different compilers:<p>
       <pre><code>
       float* pa = new <b>alignas(32)</b> float[ib*n]; // g++
       float* pa = new float[ib*n] <b>alignas(32)</b>; // clang </code></pre>
       <br />
       <br />
-      <h4>kernel control flow</h4>
+      <br />
+      <h3>kernel control flow</h3>
       <p>we're blocking the matrices into sub-matrices, now we need to split the sub-matrices into 8x8 blocks to pass them into the kernel.</p>
       <pre><code>
       for(int iii=0; iii&ltn; iii+=8) {
@@ -214,7 +221,8 @@
       </code></pre>
 
       <br />
-      <h4>8x8 kernel</h4>
+      <br />
+      <h3>8x8 kernel</h3>
       <p>the rest is easy, we only concern ourselves with the contigous packs of a and b and pick 8 values at a time from both to multiply</p>
       <p>we define workin pointers <var>wpa</var> and <var>wpb</var> into their respective packs. notice the index is the same as the beginning of the current sub-block moved in the same loop. <var>wc</var> points to the beginning of the 8x8 panel we will update in c.</p>
       <pre><code>
