@@ -40,9 +40,9 @@
   </head>
   <body>
     <main>
-      <h3>[wip] walking through a gotoBLAS/BLIS 8x8 sgemm kernel</h3>
+      <h3>walking through a gotoBLAS/BLIS 8x8 sgemm kernel</h3>
       <br />
-      <p>for a general introduction into sgemms, check out <a href="https://siboehm.com/articles/22/Fast-MMM-on-CPU" target="_blank">this</a> and <a href="https://marek.ai/matrix-multiplication-on-cpu.html" target="_blank">this</a>. Note this is not official gotoBLAS/BLIS code. It is an 8x8 AVX256 implementation of their <a href="https://www.cs.utexas.edu/users/flame/pubs/blis3_ipdps14.pdf">paper</a>. All examples are running on ubuntu 22.04.3 and compiled with g++ 11.4.0</p>
+      <p>for a general introduction into sgemms, check out <a href="https://siboehm.com/articles/22/Fast-MMM-on-CPU" target="_blank">this</a> and <a href="https://marek.ai/matrix-multiplication-on-cpu.html" target="_blank">this</a>. Note this is not official gotoBLAS/BLIS code. It is an 8x8 AVX256 implementation of their <a href="https://www.cs.utexas.edu/users/flame/pubs/blis3_ipdps14.pdf" target="_blank">paper</a>. All examples are running on ubuntu 22.04.3 and compiled with g++ 11.4.0</p>
       <br />
       <p>we define the following type as wrapper over AVX registers in order to access specific floats:</p>
       <pre><code>
@@ -58,8 +58,11 @@
         template &ltint mb, int kb, int th, int m, int n, int k&gt
         void sgemm(float* a, float* b, float* c, int lda, int ldb, int ldc) {
           // . . .
-        }
-      </code></pre>
+        } </code></pre></p>
+      <p>the function expects all matrix data to be aligned in memory, otherwise it segfaults:
+      <pre><code>
+      float* a = new <b>alignas(32)</b> float[N*N]; // g++
+      float* a = new float[N*N] <b>alignas(32)</b>; // clang </code></pre>
       <br />
       <br />
       <h3>blocking</h3>
@@ -68,7 +71,7 @@
         <tr> <th>memory</th> <th>latency</th> <th>associativity</th> <th>size</th> <th>f32</th> </tr>
         <tr> <td>L1</td> <td>~4 cycles</td> <td>8-way</td> <td>32kB /core</td> <td>~8000 /c</td> </tr>
         <tr> <td>L2</td> <td>~12 cycles</td> <td>8-way</td> <td>512kB /core</td> <td>~128.000 /c</td> </tr>
-        <tr> <td>L3</td> <td>~47 cycles</td> <td>16-way</td> <td>64MB shared</td> <td>~1.536.000</td> </tr>
+        <tr> <td>L3</td> <td>~47 cycles</td> <td>16-way</td> <td>64MB shared</td> <td>~16.384.000</td> </tr>
         <tr> <td>DRAM</td> <td>~47c+74ns</td> <td>~</td> <td>~</td> <td>~</td> </tr>
         <tr> <td>NVMe</td> <td>~25.000ns</td> <td>~</td> <td>~</td> <td>~</td> </tr>
         <tr> <td>SATA</td> <td>~100.000ns</td> <td>~</td> <td>~</td> <td>~</td> </tr>
@@ -92,7 +95,7 @@
         </pre></code>
 
       </details>
-      <p>the first step is to divide the big matrices into sub-matrices of a given block size that can fit into smaller, faster memory. In <a href="https://cs.utexas.edu/users/flame/pubs/blis3_ipdps14.pdf">the BLIS paper</a>, the authors aim to keep <var>b</var> in L3 and <var>a</var> mainly in L2. Given our SRAM sizes, this does not become a problem until the mats are bigger then 4096x4096.</p>
+      <p>the first step is to divide the big matrices into sub-matrices of a given block size that can fit into smaller, faster memory. In <a href="https://cs.utexas.edu/users/flame/pubs/blis3_ipdps14.pdf" target="_blank">the BLIS paper</a>, the authors aim to keep the current block of <var>b</var> in L3 and the current block of <var>a</var> mainly in L2. Because of this, the pack of <var>b</var> is bigger. On my CPU, we should be allowed ~15.000.000 f32's for <var>b</var> and ~1.500.000 f32's for <var>a</var>, if we use all 12 cores. </p>
       <pre> <code>
         for(int i=0; i&ltk; i+=kb) {
           int ib = std::min(k-i, kb);
@@ -102,12 +105,13 @@
             // . . . 
           }
         } </code> </pre>
+      <p>we iterate over the shared dimension <var>k</var> and <var>m</var> rows of <var>a</var>. <var>i</var> and <var>ii</var> are the block indexes and <var>ib</var>, <var>iib</var> are the current running block sizes (in case <var>k</var> or <var>m</var> are not divisible by <var>kb</var> or <var>mb</var>)</p>
       <p>We create pointers <var>wa</var> and <var>wb</var> to point to the current block:
       <pre><code>
       float* wa = &a[i*lda+ii];
       float* wb = &b[i]; 
       float* tc = &c[ii];</code></pre>
-			<p>consider <var>a</var>, <var>b</var>, <var>c</var> to be 32x32 matrices and <var>kb</var> and <var>mb</var> to be 8. <var>b</var> and <var>c</var> are split into column panels of sizes <var>kb</var> x <var>k</var> (8x32) and <var>mb</var> x <var>n</var> (8x32) starting at index <var>&b[i]</var> and <var>&c[ii]</var> respectively: </p>
+			<p>consider the matrices <var>a</var> and <var>b</var> to be 32x32 and blocks <var>kb</var> and <var>mb</var> to be 8. <var>b</var> and <var>c</var> are split into column panels of sizes <var>kb</var> x <var>k</var> (8x32) and <var>mb</var> x <var>m</var> (8x32) starting at index <var>&b[i]</var> and <var>&c[ii]</var> respectively: </p>
       <img src="block_cb.png" style="filter: grayscale(100%); width: 100%;" />
 			<p><var>a</var> is split into <var>kb</var> x <var>mb</var> (8x8) blocks starting at row <var>i</var> and column <var>ii</var>:</p>
       <img src="block_a.png" style="filter: grayscale(100%); width: 100%;" />
@@ -122,11 +126,11 @@
         <summary>about TLB misses and CPU halts</summary>
         <p>TODO</p>
       </details>
-      <p>Adding more reads and writes to optimise is counter-intuitive, but as pointed out in this <a href="https://cs.utexas.edu/users/flame/pubs/GotoTOMS_final.pdf" target="_blank"> paper</a>, <i>the cost needs not to create a substantial overhead beyond what is already exposed from the loading [...] into the L2 cache.</i></p>
+      <p>Adding more reads and writes to optimise is counter-intuitive, but as pointed out in this <a href="https://cs.utexas.edu/users/flame/pubs/GotoTOMS_final.pdf" target="_blank"> paper</a>, <i>the cost needs not to create a substantial overhead beyond what is already exposed from the loading [...] into the L2 cache and TLB.</i></p>
       <p>we allocate the packs:</p>
       <pre><code>
       float* pa = new alignas(32) float[ib*iib];
-      static float* pb = new alignas(32) float[iib*n]; // static is not thread safe </code></pre>
+      float* pb = new alignas(32) float[iib*n];</code></pre>
 			<p>in order to pack a, we loop over block size <var>ib</var>:</p>
       <pre><code>
         inline void pack_a(int ib, const float* a, int lda, float* to) {
@@ -143,9 +147,11 @@
             to += 8;
           }
         } </code></pre>
-			<p>consider that the block size is now 16 and below is the block of <var>a</var>. A call to <var>pack_a</var> copies the first 8 values of each row of the block into a buffer:</p> 
+			<p>consider that the block size is now 16 and below is the first block of <var>a</var>. A call to <var>pack_a</var> copies the first 8 values of each row of the block contiguously into the pack:</p> 
 
       <img src="pack_a.png" style="width: 100%;" />
+      <p>the pack looks like this:</p>
+      <img src="pack_a_0.png" style="width: 100%;" />
       <p>below are the first 16 rows of the block of <var>b</var>. A call to <var>pack_b</var> copies all columns of the first 8 rows of the block into a buffer:</p>
       <img src="packing_b.png" style="width: 100%;" />
         <p>because of this, we can order the elements of b column-major and skip an explicit transposition:</p>
@@ -176,11 +182,9 @@
               b_i6_ptr++; b_i7_ptr++; 
             }
           } </code></pre>
-      <p>we can call it multiple times while incrementing the starting index by 8 for a and by 8*ldb for b and pack the whole blocks, but doing so at once would be inefficient, as we don't use all the values in one iteration of the kernel.</p>
-      <p>NOTE: beware the position of alignas for different compilers:<p>
-      <pre><code>
-      float* pa = new <b>alignas(32)</b> float[ib*n]; // g++
-      float* pa = new float[ib*n] <b>alignas(32)</b>; // clang </code></pre>
+      <p>a full pack of <var>b</var> looks like this:</p>
+      <img src="pack_b.png" style="width: 100%;" />
+      <p>the packing functions are designed only to move as many values as we can pass in a single call to the 8x8 kernel. To prepare for the next kernel call, we call them again while incrementing the starting index of <var>a</var> by 8 and of <var>b</var> by 8*ldb.</p>
       <br />
       <br />
       <br />
@@ -212,16 +216,6 @@
       <p>for every iteration of this loop, we change the packed values of <var>a</var>. The next ones are:</p>
       <img src="pack_a_2.png" style="width: 100%;" />
       <p>finally, the i loop compounts all values of c to their correct end value. For every iteration of this loop, we change the packed values of b.</p>
-      <p>putting it all together, the 4 loops behave like this:</p>
-      <pre><code>
-        for each 8 values in the length of the shared dimension: // compound values
-          pack current block of b
-          for each 8 values in the length of rows of a: // updates block x n until m 
-            pack current half-block of a
-            for each row of c:  // updates block x height of c
-              for each 8x8 values from 0 to block size: // updates 8xblock
-                update 8x8
-      </code></pre>
 
       <br />
       <br />
@@ -231,8 +225,8 @@
       <pre><code>
         float* wpa = &pa[iiii*ib];
         float* wpb = &pb[iii*ib];
-        float* wc = &c[ii+iii*n+iiii]; </code></pre>
-      <p>we also define 8 __m256 registers to hold the 64 computed values of c, alongside two registers pointing to the data in the packs.</p>
+        float* wc  = &tc[iii*n+iiii]; </code></pre>
+      <p>we also define 8 __m256 registers to hold the 64 computed values of c, alongside two registers to hold the data in the packs.</p>
       <pre><code>
         m256_t c0007, c1017, c2027, c3037,
                c4047, c5057, c6067, c7077,
@@ -297,9 +291,9 @@
         m256_t c0007, c1017, c2027, c3037,
                c4047, c5057, c6067, c7077,
                a_vreg; </code></pre>
-      <p>with the addition of another 8, this puts us at 17. my processor, similar to a lot of modern processors, only has 16 physical ymm registers on the chip. explicitly defining the 8 <var>b</var> registers would introduce a lot of data movement in the part of the code that runs the most, forcing it to allocate and dealocate ymm registers to new values.</p>
-      <p>taking a look at the compiled object files lets us see that the behaviour of both solutions is very similar. the compiler uses <var>_mm256_broadcast_ss</var> and <var>_mm256_fmadd_ps</var> anyway:</p>
-      <p>inner kernel loop with <var>_mm256_broadcast_ss</var> call:</p>
+      <p>with the addition of another 8, this puts us at 17. my processor, similar to a lot of modern processors, only has 16 physical ymm registers on the chip. explicitly defining the 8 <var>b</var> registers would introduce data movement in the most important part of the code, forcing it to allocate and dealocate ymm registers to new values.</p>
+      <p>taking a look at the compiled files lets us see that the behaviour of both solutions is very similar. the compiler uses <var>_mm256_broadcast_ss</var> and <var>_mm256_fmadd_ps</var> anyway.</p>
+      <p>inner kernel loop with explicit <var>_mm256_broadcast_ss</var> call:</p>
       <pre><code>
         1a30:	c5 fc 28 00          	vmovaps (%rax),%ymm0
         1a34:	48 83 c0 20          	add    $0x20,%rax
@@ -328,7 +322,8 @@
         1aa8:	48 39 f8             	cmp    %rdi,%rax
         1aab:	75 83                	jne    1a30 <_Z5sgemm . . . >
       </code></pre>
-      <p>inner kernel loop without broadcast:</p>
+      <p>the highlighted part calls <var>vfmadd213ps</var> with the first opperand as a relative address to the <var>rsp</var> stack pointer. It multiplies <var>ymm0</var> with the 8 subsequent values from the <var>rsp</var> pointer, adds the values from <var>ymm14</var> and stores in the <var>rsp</var> stack variable, not in a <var>ymm</var> register. This small change costs us ~25% of the final performance.</p>
+      <p>inner kernel loop without explicit intrinsics:</p>
       <pre><code>
         1a00:	c4 c1 7c 28 00       	vmovaps (%r8),%ymm0
         1a05:	c5 fc 28 08          	vmovaps (%rax),%ymm1
@@ -355,15 +350,9 @@
         1a6f:	48 39 f8             	cmp    %rdi,%rax
         1a72:	75 8c                	jne    1a00 <_Z5sgemm . . . >
       </pre></code>
+      <p>we only end up using one register, <var>ymm0</var> to broadcast the values of b. this is good because we never intended to reuse the allocated <var>b*</var> registers.</p>
 
-      <p>we only end up using one register, <var>ymm0</var> to broadcast the values of b. this is good because we never intended to reuse the allocated <var>b*</var> registers again.</p>
-
-      <details>
-        <summary>understanding the assembly</summary>
-        <p>TODO (honestly, skill issue lol)</p>
-      </details>
-
-      <p>lastly we just have to update <var>c</var>. Because we are out of the innermost loop, we are ok with realocating <i>ymm</i> registers. We define 8 <i>__m256</i> registers to hold the previous values stored in <var>c</var> and load:</p>
+      <p>lastly we just have to update <var>c</var>. Because we are out of the innermost loop and don't care about the values anymore, we are ok with realocating <i>ymm</i> registers. We define 8 <i>__m256</i> registers to hold the previous values stored in <var>c</var> and load:</p>
       <pre><code>
         m256_t w0, w1, w2, w3, w4, w5, w6, w7;
 
@@ -399,9 +388,9 @@
       </pre></code>
       <p><var>_mm256_store_ps</var>, just like <var>_m256_load_ps</var> works on the 8 32-bit values following the starting pointer. We end up reading and updating 64 values in an 8x8 panel of <var>c</var>.</p>
       <br />
-      <h4>performance</h4>
+      <h3>performance</h3>
       <p>running on ubuntu 22.04.3 and compiled with g++ 11.4.0<br />
-      CPU: Ryzen 9 3900X 12 core, 4.6 GHz <br />DRAM: 128 GB 3200 MHz</p>
+      CPU: Ryzen 9 3900X 12 core, 4.6 GHz <br />DRAM: 128 GB 3200 MHz, dual channel</p>
       <table>
         <tr>
           <th>N</th>
@@ -452,6 +441,7 @@
           <td>660.59</td>
         </tr>
       </table>
+      <!--
       <p>single threaded performance:</p>
       <table>
         <tr>
@@ -471,14 +461,17 @@
           <td>78.02</td>
         </tr>
       </table>
+      -->
       <br />
-      <h4>extra: transposition</h4>
+      <br />
+      <h3>on explicit transposition</h3>
       <p>because the packing we do does not add any substancial overhead, starting out with a transposed <var>b</var> would not improve the runtime. Quite the oposite, the added runtime of the transposition kernel ends up costing us ~1-2ms for N=1024.
       <br />
       <br />
-      <h4>notes</h4>
-      <p>DM <a href=''>@riemannianmani</a> for any corrections, discussions, etc.
-      <p>if you found any of this useful, please consider superchatting Hololive's <a href="">Tokoyami Towa</a>-sama.</p>
+      <h3>notes</h3>
+      <p>find the full code <a href="https://github.com/GandalfTea/blis_8x8_avx_sgemm" target="_blank">here</a></p>
+      <p>DM <a href='https://x.com/riemannianmani' target="_blank">@riemannianmani</a> for anything related to this post</p>
+      <p>if you found any of this useful, please consider superchatting Hololive's <a href="https://www.youtube.com/channel/UC1uv2Oq6kNxgATlCiez59hw">Tokoyami Towa</a></p>
     </main>
   </body>
 </html>
