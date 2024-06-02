@@ -1,0 +1,100 @@
+
+<!DOCTYPE html />
+<html lang='en'>
+  <head>
+    <meta charset="UTF-8" />
+    <link rel='icon' type='image/jpg' href='icon.jpg' />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="in depth dive into the workings of a gotoBLAS/BLIS 8x8 matrix multiplication kernel" />
+    <title>no abstraction mnist convnet</title>
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <style>
+        body {
+          width: 650px;
+          margin: auto;
+          margin-top: 15vh;
+          font-family: Consolas,Monaco,Lucida Console,Liberation Mono,DejaVu Sans Mono,Bitstream Vera Sans Mono,Courier New;
+          margin-bottom: 20vh;
+          line-height: 1.3em;
+          background-color: black;
+          color: white;
+        }
+        body pre { line-height: 1.2em; }
+        body ul li { margin-top: 10px; }
+        body a { color: dodgerblue;}
+        body .thread { color: dodgerblue; text-decoration: none;}
+        body .thread:hover { text-decoration: underline;}
+        body hr { border: 2.5px dotted white; }
+        body p:not(:nth-child(2)) { margin-top: 30px; }
+        body p:nth-child(2) { margin-top: 0px; }
+        body h3:first-child { margin-bottom: 5px; }
+        body h4 { margin-top: 30px; }
+        body h5 { margin: 0px; font-weight: 100; }
+        body table td { width: 120px; text-align: left; }
+        body table th { width: 120px; text-align: left; }
+        body .cache td { width: 150px; }
+        body .cache th { width: 150px; }
+        @media only screen and (max-width: 650px) { 
+          body { width: 90vw !important; } 
+        }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h3>$ no abstraction mnist convnet</h3>
+      <br />
+      <p>the search for adequate abstractions starts with none.</p> 
+      <p>one needs full exposure to complexity before understanding standardized abstractions that are generally accepted. one also needs it in order to further build ontop of the abstraction chain. you can't do so starting midway. this is the reason for this post, and probably subsequent ones dealing with similar subjects</p>
+
+      <br /> <br /> <br />
+      <h4>evaluation</h4>
+      <p>cross entropy is defined as: \[ \mathcal{L}(y, s) = -\sum_{i=1}^c y_i \cdot \log_2(s_i) \]
+      <p>implemented as : </p>
+      <pre><code>
+    <b>float</b> sparse_categorical_crossentropy(<b>float*</b> in, <b>uint32_t</b> count, <b>uint8_t*</b> y) {
+      <b>float</b> sum=0.f;
+      log_softmax(in, count);
+      <b>int</b> i=0, j=0; 
+      <b style="color:#999">for</b>(; j < batch*num_classes; j+=num_classes) sum += -in[j+(<b>int</b>)y[i++]]; 
+      <b style="color:#999">return</b> sum/batch + smoothing;  
+    }
+      </pre></code>
+
+      <p>where <code>softmax</code> and <code>log-softmax</code> are defined as \( \varphi(x) : \mathbb{R}^N \rightarrow \mathbb{R}^N \) : </p>
+      <p>\[ \varphi{(x_i) = \frac{ e^{x_i-\max_x}}{\sum_j^N e^{x_j-\max_x}}} \]</p>
+      <p>\[ \ln \varphi(x_i) = x_i-\max_x - \ln\sum_{j=0}^N e^{x_j-max_x} \]</p>
+      <p>because \( \log(a/b) = \log a - \log b \)
+
+      <pre><code>
+    <b>void</b> log_softmax(<b>float*</b> in, <b>uint32_t</b> count) {
+      <b>float</b> sum = <code style="color:#999">0.f</code>;
+      <b>float</b> maxf = max(in, count); 
+      float* m = (float*)malloc(count*sizeof(float));
+      for(int i=0; i < count; i++) { 
+        <code style="color:#999">// normalising induces numerical stability against overflows</code>
+        register float bf = in[i] - maxf; 
+        m[i] = bf;
+        sum += std::exp(bf);
+      }
+      float slog = std::log2(sum);
+      for(int i=0; i < count; i++) in[i] = m[i]-slog;
+      free(m);
+    } 
+      </code></pre>
+      <p>\[ \varphi(x) : \begin{bmatrix} 1.0 \\ 2.0 \\ 3.0 \end{bmatrix} \rightarrow \begin{bmatrix} 0.09 \\ 0.24 \\ 0.67 \end{bmatrix} \]</p>
+      <p>where <code>max()</code> is :</p>
+      <pre><code>
+    float max(float* in, uint32_t count) {
+      float b = in[0];
+      while(count-- > 0) if(lt_f32(b, in[count])) b = in[count]; 
+      return b;
+    }
+      </code></pre>
+      <p>the indicator function \(1\{\cdot\} \) takes a value of 1 if \( i=j \) and 0 everywhere else</p>
+      <p>some text describing this functio \( S(a) : \mathbb{R}^N \rightarrow \mathbb{R}^N \) : </p>
+      <p>the functions is lit. that's why we do : </p>
+      <p>\[ \frac{\partial \mathcal{L}}{\partial z_j} = - \sum_{i=0}^{c} \frac{y_i}{s_i} * s_i * (1\{i=j\}-s_j) = - \sum_{i=0}^c y_i * (1\{i=j\}-s_j) \]</p>
+    </main>
+  </body>
+</html>
