@@ -11,13 +11,15 @@
         body {
           width: 650px;
           margin: auto;
-          margin-top: 15vh;
+          margin-top: 20vh;
           font-family: Consolas,Monaco,Lucida Console,Liberation Mono,DejaVu Sans Mono,Bitstream Vera Sans Mono,Courier New;
           margin-bottom: 20vh;
           line-height: 1.2em;
           background-color: black;
+          position: relative;
           color: white;
         }
+        body #arona { position: absolute; right: 140px; top: -100px; }
         body a { color: dodgerblue;}
         body .thread { color: dodgerblue; text-decoration: none;}
         body .thread:hover { text-decoration: underline;}
@@ -29,26 +31,33 @@
         body h5 { margin: 0px; font-weight: 100; }
         @media only screen and (max-width: 650px) { 
           body { width: 90vw !important; } 
+          #arona { display: none; }
         }
     </style>
   </head>
   <body>
+    <img src="arona3.gif" id='arona' />
     <main>
       <h3>mani</h3>
       <p>走り抜けろう&#12290;</p>
+      <a href="mailto:chat@riemani.ca">chat@riemani.ca</a> <br />
+      x.com/<a href="https://x.com/riemannianmani">riemannianmani</a> <br /> </p>
       <p> 
-      working on <a href="https://github.com/GandalfTea/tensorlib/blob/master/examples/efficient_mnist.cc" target="_blank">efficient MNIST</a> CPU demo for <a href="https://github.com/GandalfTea/tensorlib/" target="_blank">tensorlib</a>. <br /> 
-      will expand into a full nn library in <a href="https://github.com/GandalfTea/smolnet">smolnet</a> repo. <br />
-      moving on to CUDA PTX kernels afterwards (<a href="https://www.youtube.com/watch?v=2PPBne6GGiw&ab_channel=MarcinPrzyby%C5%82owicz-Topic" target="_blank">been good to know ya</a>) <br /> <br />
-
-      <br />
-      towa様すき <br /><br />
-      dm <a href='https://twitter.com/riemannianmani'>@riemannianmani</a> <br />
-      <a href="mailto:chat@riemani.ca">chat@riemani.ca</a>
+        <p>i do independent research in high-performance computing and machine learning. interested in instruction-level CPU and GPU optimizations on x86_64 and arm64, hardware design, physics, actually good VR/AR from decoding retinal ganglion cells, etc.</p>
+        <p> professional friend wanter. dms open<br />
+        towa様すき, green war criminal automaton too<br />
       </p>
+      <h4>currently:</h4>
+      <ul>
+        <li>implementing very fast convolutions in asm and <a href="conv.html">documenting it</a></li>
+        <li>writing an <a href="https://github.com/GandalfTea/tensorlib/blob/master/examples/efficient_mnist.cc" target="_blank">efficient MNIST</a> CPU demo for <a href="https://github.com/GandalfTea/tensorlib/" target="_blank">tensorlib</a>. </li> 
+        <li>reading the linux memory management and scheduler src</li>
+        <li>thinking about ml compilers, want to contribute to <a href="https://tinygrad.org/">tinygrad</a></li>
+      </ul>
       <br />
       <hr />
       <h4>poasts</h4>
+         > <a class="thread" href="conv.html">memory and ILP handling in 2D convolutions</a> [coming soon]<br />
          > <a class="thread" href="blisgemm.html">walking through a gotoBLAS/BLIS 8x8 sgemm kernel</a><br />
       <h4>threads</h4>
       <p> 
@@ -60,7 +69,7 @@
       <hr />
       <h4>todo</h4>
       <ul>
-        <li>escape earth, or ar least this century</li>
+        <li>escape earth, or at least this century</li>
         <li>homemade photolithography</li>
         <li>homemade turbofan with afterburner</li>
         <li>make fermion spinor fields illegal (<i>i</i> is NOT a REAL number) Riemann sphere? the only sphere i kNOW IS MY BALLS</li>
