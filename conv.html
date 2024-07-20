@@ -1,0 +1,952 @@
+
+<!DOCTYPE html />
+<html lang='en'>
+  <head>
+    <meta charset="UTF-8" />
+    <link rel='icon' type='image/jpg' href='icon.jpg' />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="transpose fast like sanic" />
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <title>memory and ILP handling in 2D convolutions</title>
+    <style>
+        body {
+          width: 680px;
+          margin: auto;
+          margin-top: 15vh;
+          font-family: Consolas,Monaco,Lucida Console,Liberation Mono,DejaVu Sans Mono,Bitstream Vera Sans Mono,Courier New;
+          margin-bottom: 20vh;
+          line-height: 1.30em;
+        }
+        body pre { line-height: 1.2em; }
+        body a { color: black; text-decoration: underline; }
+        body .thread { color: dodgerblue; text-decoration: none;}
+        body .thread:hover { text-decoration: underline;}
+        body hr { border: none; }
+        body p code { font-size: 14px;  }
+        body p:not(:nth-child(2)) { margin-top: 30px; }
+        body p:nth-child(2) { margin-top: 0px; }
+        body h3:first-child { margin-bottom: 5px; }
+        body h4 { margin-top: 30px; }
+        body h5 { margin: 0px; font-weight: 100; }
+        body table td { width: 120px; text-align: left; }
+        body table th { width: 120px; text-align: left; }
+        body pre { border-left: 1px dashed #aaa; margin-top: 30px; }
+        body p code { font-weight: bold; }
+        body .cache td { width: 150px; }
+        body .cache th { width: 150px; }
+        @media only screen and (max-width: 650px) { 
+          body { width: 90vw !important; } 
+        }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h4>memory and ILP handling in 2D convolutions</h4>
+      <br/>
+      <p>a <a href="https://en.wikipedia.org/wiki/Convolution" target="_blank">convolution</a> is defined as an integral that expresses the amount of overlap two signals represented by functions of time \(f(t)\) and \(g(t)\) have as one is reflected and shifted on top of the other. It is usually denoted by the convolution operator \(f * g\) : </p>
+      <p>\[ (f * g)(t) = \int_{-\infty}^{\infty} f(t-\tau)g(\tau) d\tau \]</p>
+      <p>where \(f(t)\) is a one-dimensional signal and \(g(t)\) is the response of a filter. As \(t\) changes, we calculate the area under the function \(f(-\tau)\) weighted by \(g(\tau)\). The negation of \(\tau\) rotates \(f\) 180\(^\circ\) about the origin. \(t\) shifts the origin of \(f\) along the \(\tau\)-axis. This can be applied on either signal, because \( (f*g)(t) = (g*f)(t) \) :</p>
+      <p>\[ \int_{-\infty}^{\infty} f(t-\tau)g(\tau) d\tau = \int_{-\infty}^{\infty} f(\tau)g(t-\tau) d\tau \]</p>
+      <p>in 2 dimensional image processing, the continuous convolution integral can be expressed as a function in a two dimensional spatial domain of coordinates \(x\) and \(y\) :</p>
+      <p>\[ (f * * g)(x, y) = \int_{-\infty}^{\infty} \int_{-\infty}^{\infty} f(x-\tau_i, y-\tau_j)g(\tau_i, \tau_j) d\tau_i d\tau_j \] </p>
+
+      <p>storing an image digitally imposes some restrictions due to a limited amount of resources. The continuous signals are sampled and quantised over a finite range to discrete values represented as tensors. The operation becomes a function of sums limited by the bounds of the filter size \(K\) :</p>
+      <p>\[ (f**g)(x, y) \equiv \sum_{\tau_i=0}^{K} \sum_{\tau_j=0}^{K} f_{x-\tau_i, y-\tau_j} \cdot g_{\tau_i, \tau_j} \]</p>
+      <p>where \(f\) is the input image \(f \in \mathbb{R}^{N \times M}\) and \(g\) is the filter \(g \in \mathbb{R}^{K \times K}\), an array of floats that serve as the trainable parameters of the network commonly initialized to a random distribution and trained using stochastic gradiant descent.</p>
+      <p>the discrete value of the signal at some index \(f_{i, j}\) is usually stored in memory as a vector of three integers \( [r, g, b]^{\intercal}\) where each takes a value \( 0 \le r,g,b \lt 2^x \) were x is the number of bits allocated to store the integer. We can represent this as a third channel dimension denoted as \(C\). Most networks also extend the filter into multiple channels in order to extract a higher number of features.</p>
+      <p>\[ f_{C \times M \times N} = \begin{bmatrix} R_{M \times N} \\ G_{M \times N} \\ B_{M \times N} \end{bmatrix}, \quad R_{M \times N} = \begin{bmatrix} r_{0, 0} & r_{0, 1} & \ldots & r_{0, N} \\ r_{1, 0} & r_{1, 1} & \ldots & r_{1, N} \\ \vdots & \vdots & \ddots & \vdots \\ x_{M, 0} & x_{M, 1} & \ldots & x_{M, N} \end{bmatrix}\]</p>
+      <p>it is also common to take as input a batch of multiple images denoted as \(B\) as opposed to a single image. Thus, \(f\) becomes a tensor of rank 4 \(f \in \mathbb{Z}^{B \times C \times N \times M}\) representing a batch of \(B\) images, each with \(C\) channels of size \(N \times M\). This yields a filter \(g \in \mathbb{R}^{1 \times C \times K \times K}\) where \(B=1\) because we intend to use the same filter on all images.</p>
+      <p>we will denote the output tensor as \(\gamma \in \mathbb{R}^{B \times C \times M_{out} \times N_{out}}\).</p>
+      <p>\[ \gamma_{b, x, y} = \sum^K_{\tau_i}\sum^K_{\tau_j} f_{b, c, x-\tau_m, y-\tau_n} \cdot g_{c, \tau_m, \tau_n}\]</p>
+      <p>where the output size is given by:</p>
+      <p>\[ N_{out} =  \frac{N + 2p - K}{s} + 1\]</p>
+      <p>where \(p\) is the padding size and \(s\) is the stride.</p>
+
+      <br />
+      <hr />
+      <h4>convolution vs cross-correlation</h4>
+      <p>a convolution integral that doesn't reflect the shifted signal is known as a <a href="https://en.wikipedia.org/wiki/Cross-correlation" target="_blank">cross-correlation</a>, denoted as \((f \star g)(t)\) :</p>
+      <p>\[ (f \star g)(t) = \int_{-\infty}^{\infty} f(\tau)g(\tau+t) d\tau \]</p>
+      <p>you will often find it defined using the <a href="https://en.wikipedia.org/wiki/Complex_conjugate" target="_blank">complex conjugate</a> of \(f\) to account for complex signals :</p>
+      <p>\[ (f \star g)(t) = \int_{-\infty}^{\infty} \overline{f(\tau)}g(\tau+t) d\tau\]</p>
+      <p>if the shifted signal is symmetric, cross-correlation and convolution become the same operation. We will be shifting the filter tensor \(g\), which is randomly initialized to some distribution. If we think of this tensor as being filled with a probability density function \(\xi\), it becomes symmetric. We can, therefore, remove the complexity of having to reflect it. The discrete version becomes:</p>
+      <p>\[(f \star g)(x) = \sum_{\tau=0}^K f_{\tau}g_{x+\tau} \]</p>
+      <p>in the case of two dimensional images:</p>
+      <p>\[(f \star g)(x, y) = \sum_{\tau_i}^K\sum_{\tau_j}^K f_{\tau_i, \tau_j}g_{x+\tau_i, y+\tau_j} \]</p>
+      <p>therefore our equation becomes: </p>
+      <p>\[ \gamma[b, x, y] = \sum^K_{\tau_i}\sum^K_{\tau_j} f[b, c, \tau_i, \tau_j] \cdot g[1,c, \tau_i+x, \tau_j+y]\]</p>
+
+      <br />
+      <h4>setup</h4>
+      <p>the code is running on: </p>
+      <ul>
+        <li>ryzen 9 3900x 12 core @ 4.6GHz</li>
+        <li>128GB DDR4 @ 3200MHz</li>
+        <li>MSI MAG B550 TOMAHAWK (MS-7C91)</li>
+        <li>ubuntu 22.04.3 - kernel 6.5.0-41-generic</li>
+      </ul>
+      <p>compiled with gcc 11.4.0 with flags: -O3 -match=native</p>
+      <p>while the algorithm is agnostic to it's inputs, we'll consider a batch of 512 images from the <a href="https://yann.lecun.com/exdb/mnist/" target="_blank">MNIST dataset</a>, stored linearly in memory as single precision floats with a height and width of \(M=N=28\) and one luminiosity channel:</p>
+      <p>\[ f \in \mathbb{R}^{512 \times 1 \times 28 \times 28}, \quad 0 \le f_{b,c,i,j} \lt 256\]</p>
+      <p>the filter will have one channel and a height and width of \(K=5\). A multi channel implementation will not add significant overhead. It can be initialized to something like a <a href="https://proceedings.mlr.press/v9/glorot10a/glorot10a.pdf" target="_blank">kaiming uniform</a> distribution:</p>
+      <p> \[ g \in \mathbb{R}^{1 \times 1 \times 5 \times 5}  \sim U \begin{bmatrix} -\frac{\sqrt{6}}{\sqrt{K + K + 1}}, \frac{\sqrt{6}}{\sqrt{K+K+1}} \end{bmatrix} \]</p>
+
+      <br />
+      <h4>code</h4>
+      <p>a naive implementation would be : </p>
+      <pre><code>  <b>void</b> naive_conv2d(<b>const float*</b> f, <b>const float*</b> g, <b>float*</b> out, <b>const int</b> K, 
+                    <b>const int</b> N, <b>const int</b> M, <b>const int</b> B) 
+  { 
+    <b>const int</b> n_out = (N-K)/1+1; <spam style="color: #666;">// (img_size-filter_size) / stride + 1</spam>
+    <b>const int</b> m_out = (M-K)/1+1;
+    <b>const int</b> bo = n_out*m_out;  <spam style="color: #666;">// batch stride out</spam>
+    <b>const int</b> bi = N*M;          <spam style="color: #666;">// batch stride in</spam>
+    <b>int</b> b, n, m, i, j;
+
+    <b>for</b>(b=0; n < B; n++)
+      <b>for</b>(n=0; n < n_out; n++)
+        <b>for</b>(m=0; m < m_out; m++) 
+          <b>for</b>(i=0; i < K; i++)
+            <b>for</b>(j=0; j < K; j++)
+              out[b*bo+n*n_out+m] += f[b*bi+(n+i)*N+j+m] * g[i*K+j];
+  } </code></pre>
+    <p>called on heap allocated unaligned memory.</p>
+    <p>because of the high number of <code>float</code> operations, when compiled, the program makes use of SIMD vector instructions instead of <a href="https://en.wikipedia.org/wiki/X87" target="_blank">x87</a> precision ones. The CPU supports AVX-256 and contains 16 256-bit <code>ymm</code> logical registers per core. The program first tries to fill as many of these registers as possible with broadcasted (<code>vbroadcastss</code>) values of the filter <code>g</code> from the general purpose register <code>r12</code>. Because there are 25 distinct filter values, it stores the overflow in stack variables between <code>392[rsp]</code> and <code>104[rsp]</code>:</p>
+      <pre style="overflow-y: scroll; height: 400px;"><code>
+  .L11:
+    [ . . . ]
+    vbroadcastss  ymm0, DWORD PTR 60[r12]
+    lea rax, 16[r13]
+    vbroadcastss  ymm1, DWORD PTR 56[r12]
+    lea r8, 4[r13]
+    mov QWORD PTR -32[rsp], rax
+    lea rax, 116[r13]
+    vbroadcastss  ymm15, DWORD PTR [r12]
+    vbroadcastss  ymm14, DWORD PTR 4[r12]
+    mov QWORD PTR -24[rsp], rax
+    lea rax, 120[r13]
+    vbroadcastss  ymm13, DWORD PTR 8[r12]
+    lea rdi, 8[r13]
+    mov QWORD PTR -16[rsp], rax
+    lea rax, 124[r13]
+    vbroadcastss  ymm12, DWORD PTR 12[r12]
+    lea rsi, 12[r13]
+    mov QWORD PTR -8[rsp], rax
+    lea rax, 128[r13]
+    vbroadcastss  ymm11, DWORD PTR 16[r12]
+    lea rcx, 112[r13]
+    mov QWORD PTR [rsp], rax
+    lea rax, 224[r13]
+    vbroadcastss  ymm10, DWORD PTR 20[r12]
+    lea rbx, 456[r13]
+    mov QWORD PTR 8[rsp], rax
+    lea rax, 228[r13]
+    vbroadcastss  ymm9, DWORD PTR 24[r12]
+    lea r11, 460[r13]
+    mov QWORD PTR 16[rsp], rax
+    lea rax, 232[r13]
+    vbroadcastss  ymm8, DWORD PTR 28[r12]
+    lea r10, 464[r13]
+    vmovaps YMMWORD PTR 392[rsp], ymm0
+    vbroadcastss  ymm0, DWORD PTR 64[r12]
+    mov QWORD PTR 24[rsp], rax
+    lea rax, 236[r13]
+    mov QWORD PTR 32[rsp], rax
+    lea rax, 240[r13]
+    mov QWORD PTR 40[rsp], rax
+    lea rax, 336[r13]
+    vbroadcastss  ymm7, DWORD PTR 32[r12]
+    mov QWORD PTR 48[rsp], rax
+    lea rax, 340[r13]
+    vbroadcastss  ymm6, DWORD PTR 36[r12]
+    mov QWORD PTR 56[rsp], rax
+    lea rax, 344[r13]
+    vbroadcastss  ymm5, DWORD PTR 40[r12]
+    vbroadcastss  ymm4, DWORD PTR 44[r12]
+    mov QWORD PTR 64[rsp], rax
+    lea rax, 348[r13]
+    vbroadcastss  ymm3, DWORD PTR 48[r12]
+    vbroadcastss  ymm2, DWORD PTR 52[r12]
+    vmovaps YMMWORD PTR 360[rsp], ymm0
+    vbroadcastss  ymm0, DWORD PTR 68[r12]
+    mov QWORD PTR 72[rsp], rax
+    lea rax, 352[r13]
+    mov QWORD PTR 80[rsp], rax
+    lea rax, 448[r13]
+    mov QWORD PTR -120[rsp], r14
+    mov r14, r12
+    mov QWORD PTR 88[rsp], rax
+    lea rax, 452[r13]
+    vmovaps YMMWORD PTR -88[rsp], ymm1
+    mov QWORD PTR 96[rsp], rax
+    xor eax, eax
+    vmovaps YMMWORD PTR 328[rsp], ymm0
+    vbroadcastss  ymm0, DWORD PTR 72[r12]
+    vmovaps YMMWORD PTR 296[rsp], ymm0
+    vbroadcastss  ymm0, DWORD PTR 76[r12]
+    vmovaps YMMWORD PTR 264[rsp], ymm0
+    vbroadcastss  ymm0, DWORD PTR 80[r12]
+    vmovaps YMMWORD PTR 232[rsp], ymm0
+    vbroadcastss  ymm0, DWORD PTR 84[r12]
+    vmovaps YMMWORD PTR 200[rsp], ymm0
+    vbroadcastss  ymm0, DWORD PTR 88[r12]
+    vmovaps YMMWORD PTR 168[rsp], ymm0
+    vbroadcastss  ymm0, DWORD PTR 92[r12]
+    vmovaps YMMWORD PTR 136[rsp], ymm0
+    vbroadcastss  ymm0, DWORD PTR 96[r12]
+    mov r12, r15
+    mov r15, r14
+    mov r14, r9
+    vmovaps YMMWORD PTR 104[rsp], ymm0</code></pre>
+    <p>an example store relative to the <code>rsp</code> stack pointer would be:</p>
+    <pre><code>    vbroadcastss  ymm0, DWORD PTR 72[r12]
+    vmovaps YMMWORD PTR 296[rsp], ymm0 </code></pre>
+    <p>we end up with 14 <code>ymm15-2</code> registers filled with broadcasted values of <code>g</code> and 11 stack variables of 32 bytes we can easily load. Any variable stored in the stack can be assumed to be in L1D cache. Intermittently, the program also stores pointers at different offsets into <code>f</code> from the register <code>r13</code>. For example :</p>
+    <pre><code>    lea rax, 352[r13]
+    mov QWORD PTR 80[rsp], rax
+    lea rax, 448[r13] 
+    [ . . . ]
+    mov QWORD PTR 88[rsp], rax </code></pre>
+
+    <p><a href="https://www.felixcloutier.com/x86/lea" target="_blank">lea</a>, or <i>load effective address</i> grabs the location in memory of the second operand and stores it in the first operand. It works like <code>&variable</code> in C. We store 17 pointers of 8 bytes each. These offsets represent almost all of the read addresses of <code>f</code> for a single filter position. To understand the values we first have to look at how the compiler decided to vectorize the operation.</p>
+      <p>if we were to lay out 8 consecutive horizontal positions of the filter with a stride of 1, we would notice that the first 8 consecutive array elements of <code>f</code> correspond to the same element of the filter for each of the individual filter positions:</p>
+      <br />
+      <img src="conv.png" style="width:100%; filter: invert(1);" />
+      <p>we'll designate a <code>ymm</code> register to accumulate into. We then load the first 8 values from <code>f</code>, multiply them by the first element of <code>g</code> and add them to the output register. Next, we stride by one element (4 bytes) and repeat \(K\) number of times. By this point we have read into memory 12 individual values from <code>f</code>. We then jump to the beginning of the next matrix row and repeat \(K\) number of times. We end up computing 8 consecutive convolutions in parallel.</p>
+      <p>we'll refer to this to this part of the program as the <i>kernel</i>.</p>
+      <p>in pseudocode : <br/><br/> 
+      &emsp;\(i, j \leftarrow 0\) <br/>
+      &emsp;ymm0 \(\leftarrow\) broadcast 0 <br/>
+      &emsp;while \(i < K\): <br/>
+      &emsp;&emsp;while \(j < K\): <br/>
+      &emsp;&emsp;&emsp;ymm1 \(\leftarrow\) \(f + j\), read 32 bytes <br />
+      &emsp;&emsp;&emsp;ymm2 \(\leftarrow\) \(g + j\), broadcast 4 bytes to 32 bytes<br/>
+      &emsp;&emsp;&emsp;ymm0 \(\leftarrow\) (ymm1 * ymm2) + ymm0<br/>
+      &emsp;&emsp;&emsp;\(j \leftarrow j + 1\) <br/>
+      &emsp;&emsp;\(f \leftarrow f + 96\) bytes  <br/>
+      &emsp;&emsp;\(g \leftarrow g + K*4\) bytes  <br/>
+      &emsp;&emsp;\(i \leftarrow i +  8\) <br/> </p>
+  <p>this yields 5 32-byte reads per row, iterated for 5 rows, resulting in a total of 25 load instructions from <code>f</code>. The 17 stack variables store the address for the majority of these necessary load instructions, with the exception of some that are loaded directly into registers:</p>
+      <pre><code>    lea r8, 4[r13]
+    lea rdi, 8[r13]
+    lea rsi, 12[r13]
+    lea rcx, 112[r13]
+    lea rbx, 456[r13]
+    lea r11, 460[r13]
+    lea r10, 464[r13] </code></pre>
+    <p><code>r13</code> with the first 3 registers point to the first 4 loads of the first row, <code>rcx</code> points to the first address from the second row and the rest point to the first 3 addresses of the 5th row. Together with the previous 17 addresses and <code>r13</code> itself, they total 25.</p>
+    <p>as we'll see later, these addresses are accessed sequentially, so loading a register with the addresses of the last row is unnecessary. We can guess that the compiler intended to implement a form of <a href="https://en.wikipedia.org/wiki/Software_pipelining" target="_blank">software pipelining</a>, an out of order optimization method used on loops that are not inter-dependent across iterations, mimicking CPU pipelining, but the loops turned out to be dependent.</p> 
+    <p>we advance into the actual computation:</p>
+      <pre style="overflow-y: scroll; height: 400px;"><code>
+  .L5:
+    vmovups ymm0, YMMWORD PTR 0[r13+rax]
+    <b>vfmadd213ps ymm0, ymm15, YMMWORD PTR [rdx+rax]</b>
+    mov r9, QWORD PTR -32[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    <b>vfmadd231ps ymm0, ymm14, YMMWORD PTR [r8+rax]</b>
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    <b>vfmadd231ps ymm0, ymm13, YMMWORD PTR [rdi+rax]</b>
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm12, YMMWORD PTR [rsi+rax]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm11, YMMWORD PTR [r9+rax]
+    mov r9, QWORD PTR -24[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm10, YMMWORD PTR [rcx+rax]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm9, YMMWORD PTR [r9+rax]
+    mov r9, QWORD PTR -16[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm8, YMMWORD PTR [r9+rax]
+    mov r9, QWORD PTR -8[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm7, YMMWORD PTR [r9+rax]
+    mov r9, QWORD PTR [rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm6, YMMWORD PTR [r9+rax]
+    mov r9, QWORD PTR 8[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm5, YMMWORD PTR [r9+rax]
+    mov r9, QWORD PTR 16[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm4, YMMWORD PTR [r9+rax]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    mov r9, QWORD PTR 24[rsp]
+    vmovaps ymm1, YMMWORD PTR -88[rsp]
+    vfmadd231ps ymm0, ymm3, YMMWORD PTR [r9+rax]
+    mov r9, QWORD PTR 32[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm2, YMMWORD PTR [r9+rax]
+    mov r9, QWORD PTR 40[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r9+rax]
+    mov r9, QWORD PTR 48[rsp]
+    vmovaps ymm1, YMMWORD PTR 392[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r9+rax]
+    mov r9, QWORD PTR 56[rsp]
+    vmovaps ymm1, YMMWORD PTR 360[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r9+rax]
+    mov r9, QWORD PTR 64[rsp]
+    vmovaps ymm1, YMMWORD PTR 328[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r9+rax]
+    mov r9, QWORD PTR 72[rsp]
+    vmovaps ymm1, YMMWORD PTR 296[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r9+rax]
+    mov r9, QWORD PTR 80[rsp]
+    vmovaps ymm1, YMMWORD PTR 264[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r9+rax]
+    mov r9, QWORD PTR 88[rsp]
+    vmovaps ymm1, YMMWORD PTR 232[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r9+rax]
+    mov r9, QWORD PTR 96[rsp]
+    vmovaps ymm1, YMMWORD PTR 200[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r9+rax]
+    vmovaps ymm1, YMMWORD PTR 168[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [rbx+rax]
+    vmovaps ymm1, YMMWORD PTR 136[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r11+rax]
+    vmovaps ymm1, YMMWORD PTR 104[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r10+rax]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    add rax, 32
+    cmp rax, 96
+    jne .L5
+    mov r9, r14
+    mov r14, QWORD PTR -120[rsp]
+    mov rax, r15
+    mov r15, r12
+    lea rdi, 112[r9]
+    mov r12, rax </code></pre>
+    <p>the first 3 <code>vfmaddps</code> instructions are highlighted for convenience. The first instance is <code>vfmadd213ps</code> and all subsequent ones are <code>vfmadd231ps</code>. The numbers indicate the order of the operands, <code>213</code> means operand 2 is multiplied to 1, added with 3 and stored in 1. The first operand <code>ymm0</code> serves as the accumulation register, the second operand makes use of the previousely broadcasted values of <code>g</code> in registers <code>ymm15-2</code> and afterwards loads from memory into <code>ymm1</code>:</p>
+    <pre><code>    vmovaps ymm1, YMMWORD PTR 392[rsp] </code></pre>
+    <p>the third operand points to the values of <code>f</code> and makes use of the previously stored pointers to which we add the register <code>rax</code>. Usually register addition is straightforward, we simply add the values stored inside. This time, however, the registers contain memory addresses: </p>
+    <pre><code>    mov r9, QWORD PTR 96[rsp] </code></pre>
+    <p>The memory in question is <i>virtual memory</i>, who is described in the <a href="https://www.amd.com/content/dam/amd/en/documents/processor-tech-docs/programmer-references/40332.pdf" target="_blank">AMD64 Architecture Guide</a> as consisting of <i>the entire address space available to programs. It is a large linear-address space that is translated by a combination of hardware and operating-system software to a smaller physical-address space, parts of which are located in memory and parts on disk or other external storage media</i>.</p><p>In the case of my CPU, it is a 64-bit linear memory space that is by default unsegmented. Operating systems create segmentations between code, stack and data for memory protection purposes. The base address of the memory space is 0 and a location in it is specified using a <i>segment:offset</i> <a href="https://en.wikipedia.org/wiki/Logical_address" target="_blank">logical address</a>, often refered to as a <i>long pointer</i>. Inside of a segment, we only need the <i>offset</i> part of the logical address, refered to as an <a href="https://faculty.cs.niu.edu/~berezin/463/notes/addrmode.html" target="_blank">effective address</a>, or a <i>near pointer</i>. All of these addresses are manipulated as <i>unsigned integers</i> offsets from the root of the memory space and support integer arithmetic.</p>
+
+    <p>the register <code>rax</code> is used as both a displacement into <code>f</code> and for triggering the loop back to .L5. In the C code this loop tracks <code>m_out</code>. The previousely computed addresses don't need to be computed again and we simply offset from them. This has a latency of 0 cycles. The register starts at 0 and is incremented by 32 bytes each loop until it is equal to 96, so 3 loops, repeating the 8 convolutions until they compute 24 values. Before this loop, the last operation with <code>rax</code> is a <code>lea</code> into the address <code>448[r13]</code>. Why is this address treated as 0?</p>
+    <p><code>rax</code> is the 64-bit extension of <code>eax</code>. They refer to the same logical register, so the instruction that follows:</p>
+    <pre><code>     xor eax, eax</code></pre>
+    <p>sets the lower half of the register to 0. Writing to <code>eax</code> automatically clears the upper 32 bits, so the entire register is now 0.</p>
+    <p>The third operand is also the only one that is grabbed directly from memory. We can guarantee the other two are in L1D, but this one could be anywhere if not properly prefetched. Thankfully, modern CPUs are really good at prefetching, so we are unlikely to incur a cache miss, but our later implementations will explicitly load L1D and L2 cache.</p>
+
+    <br /> <br />
+
+    <p>let us turn our attention towards instruction-level parallelism.</p>
+    <p>modern CPUs are <a href="https://en.wikipedia.org/wiki/Superscalar_processor" target="_blank">superscalers</a> and contain multiple execution units that can process instructions concurrently each cycle. For example, the Floating Point Unit on the Zen 2 microarchitecture manages 4 execution pipes 256-bit wide that can handle x87, MMX, SSE and AVX instructions. For single precision floats, this puts us at 32 FLOPs/cycle. But while we can launch up to 4 instructions per cycle, we are still held back by the actual execution time until that instruction is resolved and retired. This is refered to as an instruction's <i>latency</i>. From Agner Fog's <a href="https://www.agner.org/optimize/instruction_tables.pdf" target="_blank">instruction tables</a> we learn that both VFMADDPS and VADDPS have a latency of 5 cycles, meaning we can only expect the output to be usable in another computation after 5 cycles.</p>
+    <p>in the case of a load instruction like VMOVUPS who also has a 5 cycle latency, it only holds true if the data is already in L1D cache. If there is a cache miss, we also have to add the latency of bringing the data into the L1 cache. This latency depends on where the data is. The worst case scenario is the RAM, in which case we have to add 66 ns and  38 cycles, which is bound to stall the process in the CPU. You can see the cost of other cache layers for Zen 2 <a href="https://www.7-cpu.com/cpu/Zen2.html">here</a>.</p>
+    <p>data dependencies are another reason we fail to schedule parallel execution. Let us imagine a loop that calls two instructions:</p>
+    <pre><code>  loop:
+     add rax, 1
+     add rax, 2 </code></pre>
+    <p>the second call to <code>add</code> has to wait for the first one to resolve before executing. It is <i>data dependent</i> on the first call and can not be processed in parallel. Another method of achieving parallelism is <a href="https://en.wikipedia.org/wiki/Software_pipelining" target="_blank">software pipelining</a>, in which we would unroll the loop and attempt to execute different iterations in parallel. Here we hit the second type of dependency, inter-loop. We cannot begin to work on the second iteration of the loop without waiting for the first iteration to fully resolve the value of <code>rax</code>. Dependencies are a property of programs, and depend entirely on the logical algorithm chosen. The above example cannot be run in parallel, so we decide to change the algorithm to use an extra register:</p>
+    <pre><code>  loop:
+    add rax, 1
+    add rbx, 2 
+  add rax, rbx</code></pre>
+    <p>now both <code>add</code> instructions are independent and can run in parallel. The cost of a loop iteration is the latency of a single <code>add</code> as opposed to 2 in the last example. Note this example is still inter-loop dependent.</p>
+
+    <br /><br />
+    <p>often times when we have to translate a software algorithm into a hardware circuit on a PCB, we deal with two properties: <a href="https://schaumont.dyn.wpi.edu/ece4530f19/lectures/lecture18-notes.html" target="_blank">data flow</a> and <a href="https://schaumont.dyn.wpi.edu/ece4530f19/lectures/lecture18-notes.html" target="_blank">control flow</a>. They serve as a framework to understand dependencies.</p> 
+    <p><i>data flow</i> describes the logic of the program. It follows the informational input as it is digested through the instruction pipeline. It is often visualised in the form of a <i>data flow graph</i> where each node is an operation, or a specific instruction, and every edge is a data dependency. If we were to execute two instructions in a way that would violate a data edge relationship, we would change the logic of the program. It follows that instructions with no data edge relationship can be executed out of order.</p>
+    <p><i>control flow</i> describes the implementation of the data flow, the order of operations as described by the program. The fact that two operations have to execute sequentially here is not a contraint of a program's logic but a choice on how that logic was computationally implemented. It is often visualised as a <i>control flow graph</i> where each node is an operation, or an instruction, and each edge is the flow of control. The goal is to reduce control flow dependencies.</p>
+    <p>they are similar, but track different things. Consider the example: </p>
+    <pre><code>    a:
+      noop
+      jmp b 
+
+    loop:
+      b: 
+        add eax, 1
+      jmp a </code></pre>
+    <p>the jump to <code>a</code> does nothing, yet the loop still has to yield control.</p>
+    <p>both are needed to fully describe a computer program. An efficient implementation is one that follows the DFG with as little control sequential overhead as possible. This is at points harder then it seems because of the sequential property of programming languages. Modern compilers handle the parallelization and use these flows for optimisations like <a href="https://en.wikipedia.org/wiki/Constant_folding" target="_blank">constant propagation</a> and <a href="https://www.cs.cornell.edu/courses/cs4120/2022sp/notes.html?id=livevar#:~:text=Live%20variable%20analysis%20is%20the,in%20the%20control%2Dflow%20graph." target="_blank">live-variable analysis</a>.</p>
+
+    <br /> <br />
+    <p>because our two inner loops are fully unrolled, there is no control flow overhead affecting them. A full single run of the pre-unrolled loop can be described by these 4 instructions:</p>
+    <pre><code>    mov r9, QWORD PTR 56[rsp]
+    vmovaps ymm1, YMMWORD PTR 360[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r9+rax] </code></pre>
+    <p>we notice a couple of dependencies right away. <code>vfmadd231ps</code> needs the pointer into <code>f</code> from the <code>mov</code> instruction and the broadcasted values of <code>g</code> from the <code>vmovaps</code> instruction. These are called <i>read after write</i> or <i>RAW</i> dependencies. If we zoom out and consider multiple iterations of this loop, we also notice two RAW dependencies on the previous <code>vfmadd231ps</code> for the accumulated values in <code>ymm0</code>, one for the <code>vmovups</code> instruction that copies the values into memory, and another in the next <code>vfmadd231ps</code>.</p>
+    <p>also notice that across iterations, the registers <code>ymm1</code>, <code>ymm0</code> and <code>r9</code> are reused. Theoretically this inferes another type of dependency on the program, forcing the next iterations of the loop to wait until <code>vfmadd231ps</code> is done with the registers, a latency of 5 cycles, before being able to load into them again:</p>
+    <pre><code>    mov <b>r9</b>, QWORD PTR 64[rsp]
+    vmovaps <b>ymm1</b>, YMMWORD PTR 328[rsp]
+    vmovups YMMWORD PTR [rdx+rax], <b>ymm0</b>
+    vfmadd231ps <b>ymm0</b>, <b>ymm1</b>, YMMWORD PTR [<b>r9</b>+rax]
+
+    mov <b>r9</b>, QWORD PTR 72[rsp]
+    vmovaps <b>ymm1</b>, YMMWORD PTR 296[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r9+rax]
+    
+    mov <b>r9</b>, QWORD PTR 80[rsp]
+    vmovaps <b>ymm1</b>, YMMWORD PTR 264[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r9+rax]
+
+    mov <b>r9</b>, QWORD PTR 88[rsp]
+    vmovaps <b>ymm1</b>, YMMWORD PTR 232[rsp]
+    vmovups YMMWORD PTR [rdx+rax], ymm0
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r9+rax] </code></pre>
+    <p>CPUs cannot deal with RAW dataflow dependencies, because changing the dataflow graph results in changing the underlying logic of the program. But, they are good at dealing with dependencies caused by reuse of registers in successive instructions that do not have a data dependency.</p>
+    <p>the process is called <a href="https://en.wikipedia.org/wiki/Register_renaming" target="_blank">register renaming</a>. Just like the distinction between logical addresses in virtual memory and physical addresses in physical memory, there is a layer of virtualisation above physical registers that describe the so called <a href="https://techpubs.jurassic.nl/library/manuals/2000/007-2490-001/sgi_html/t5.Ver.2.0.book_393.html#:~:text=Logical%20register%20numbers%20are%20dynamically,into%20a%20new%20physical%20register." target="_blank">logical registers</a> available to programs. They are defined by the CPUs architecture. In the case of our CPU, 16 <code>ymm</code> vector registers and 16 general purpose 64-bit registers. There is no direct correlation of the logical registers to physical registers on the CPU die. <code>ymm0</code> can be mapped on any physical register. Typically, the number of physical registers is bigger then logical ones. In the current CPU, each core has one 160-entry register file, where each entry is 256-bit wide. A lot are used internally for things like <a href="https://en.wikipedia.org/wiki/Speculative_execution" target="_blank">speculative execution</a>. We only have control over the logical registers.</p>
+    <p>consider the following set of instructions:</p>
+    <pre><code>     mul r12, r10, r11
+     div r13, r11, r10
+     add r10, r12, r11 </code></pre>
+    <p>they are dependent on each other. We can understand these dependencies better if instead of logical register references we refer to the operands as <i>tags</i>, here denoted as <code>t</code> followed by an index. We start with <code> t0, t1, t2, t3</code> abstracting <code>r10, r11, r12, r13</code> respectively:</p>
+    <pre><code>     mul t4, t0, t1
+     div t5, t1, t0
+     add t6, t4, t1 </code></pre>
+    <p>every time we encounter a computation, we refer to it's resulting value as a new <code>t</code> tag. So, instead of storing the result of <code>mul</code> into <code>t2(r12)</code>, we denote it as a new tag <code>t4</code>.</p>
+    <p>on die, these tags are returned from a <a href="https://en.wikipedia.org/wiki/Register_renaming" target="_blank">rename file</a> that indexes registers referenced in the program. Each tag has a related <i>ready bit</i> set to 0 if the tag is unresolved and 1 if the instructions preceding it have been executed and value resolved. For every tag write, a new tag is pulled from a free tag pool and a new mapping is written into the rename file such that any future instruction reading the architectural register will be refered to this new tag.</p>
+    <p>if we apply this logic to the above asm, we get:</p>
+    <pre><code>    mov <b>g2</b>, QWORD PTR 64[rsp]
+    vmovaps <b>y1</b>, YMMWORD PTR 328[rsp]
+    vmovups YMMWORD PTR [g1+g0], <b>y0</b>
+    vfmadd231ps <b>y2</b>, <b>y0</b>, <b>y1</b>, YMMWORD PTR [<b>g2</b>+g0]
+
+    mov <b>g3</b>, QWORD PTR 72[rsp]
+    vmovaps <b>y3</b>, YMMWORD PTR 296[rsp]
+    vmovups YMMWORD PTR [g1+g0], <b>y2</b>
+    vfmadd231ps <b>y4</b>, <b>y2</b>, <b>y3</b>, YMMWORD PTR [<b>g3</b>+g0]
+    
+    mov <b>g4</b>, QWORD PTR 80[rsp]
+    vmovaps <b>y5</b>, YMMWORD PTR 264[rsp]
+    vmovups YMMWORD PTR [g1+g0], <b>y4</b> 
+    vfmadd231ps <b>y6</b>, <b>y4</b>, <b>y5</b>, YMMWORD PTR [<b>g4</b>+g0]
+
+    mov <b>g5</b>, QWORD PTR 88[rsp]
+    vmovaps <b>y7</b>, YMMWORD PTR 232[rsp]
+    vmovups YMMWORD PTR [g1+g0], <b>y6</b> 
+    vfmadd231ps <b>y8</b>, <b>y6</b>, <b>y7</b>, YMMWORD PTR [<b>g5</b>+g0] </code></pre>
+    <p>where the <code>g</code> tags are pulled from a GPR pool and the <code>y</code> tags from a <code>ymm</code> register pool. I've also separated the destination operand and the first operand in the <code>vfmadd231ps</code> calls to fit all the necessary tags. Not highlighted, <code>g0</code> is the <code>rax</code> register and <code>g1</code> is the <code>rdx</code> register.</p>
+    <p>this change helps the CPU schedule instructions only when all dependencies have been resolved by just checking the ready bits. It also helps us visualise the data dependencies better. We can tell now that the only data relationship between the iterations is the output register from <code>vfmadd231ps</code> used to move into memory and accumulate.</p>
+    <p>the first 11 iterations of the loop do not need a <code>vmovaps</code> to broadcast values of <code>g</code> and 8 seemingly random iterations don't need the <code>move</code> to grab the <code>f</code> pointer. The third instruction, <code>vmovups</code> is repeated on every iteration without ever changing the address at which <code>ymm0</code> is moved into, <code>rdx+rax</code>, thus overwriting it 25 times.</p>
+
+    <br />
+    <p>to understand how the instructions could be scheduled, we plot the DFG</p>
+    <img src="./datagraph0.png" style="width: 100%;" />
+    <p>even if we have two data dependencies, only one of them dictates when the next iteration can start, <code>vfmadd231ps</code>. It is called the <i>critical path</i> and it's represented by the bold line annotated with the latency.</p>
+    <p>for benchmarking purposes, let's calculate the <i>instructions per cycle</i>, or IPC. We have 25 <code>mov</code>, <code>vmovaps</code>, <code>vmovups</code> and <code>fma</code> instructions, totalling 25*4 = 100 instructions per kernel call. We expect this call to take 5+25*5+5 = 135 cycles, resulting in 100/135 = 0.74 IPC.</p>
+    <p>one good thing about this structure is that loop iterations are not inter-dependent, meaning we can theoretically run two loop iterations at the same time if we disregard the number of registers required. I've removed the dependency lines to the <code>mov</code> instructions because the latency is only 1 cycle:</p>
+    <img src="./datagraph5.png" style="width: 100%;" />
+    <p>where instructions prefixed with <code>2</code> represent the second iteration.</p>
+    <p>we have 200 instructions per 136 cycles, putting us at 1.47 IPC. Notice, though, that we have redundant load operations. <code>vmovaps 0</code> and <code>vmovaps 20</code> refer to the same data loaded in two different registers. If we were to only load it once, it would constitute a <i>read after read</i> (RAR) dependency on that register, which is not considered a type of hazard but on certain architectures can be a 1 cycle latency delay.</p> 
+
+    <br /><br />
+    <p>on modern chips, registers are usually packed together into <a href="https://en.wikipedia.org/wiki/Register_file" target="_blank">physical register files</a>, or PRFs, usually implemented as <a href="https://en.wikipedia.org/wiki/Static_random-access_memory">SRAM</a>. We know from <a href="https://www.amd.com/content/dam/amd/en/documents/processor-tech-docs/programmer-references/40332.pdf" target="_blank">official AMD documentation</a> that each core's FPU register file contains 160 256-bit wide entries. We also know it connects to 4 asymetric execution pipes. Only pipe 0 and pipe 1 can execute <code>FMA</code> instructions, which require three operands, and they each need to borrow a PRF read port from pipe 3, stalling this pipe for one cycle. While the documentation does not specify how many such ports the PRF has, we can guess each pipe has 2 individual read ports and at least one individual write port, totalling 8 read ports and 4 write ports, plus another 2 write ports from cache, each 256-bit wide. Only pipe 2 can send data to the <i>Store Queue</i> at a bandwidth of 256-bits per cycle.</p>
+    <p>the pipes are also capable of <i>superforwarding</i>, meaning when an instruction is done and the output has to be used in another instruction, it can feed it directly to the pipe through a <i>bypass network</i>, skipping a write and read into the PRF. This enables faster execution of dependent instructions.</p>
+    <p>the only instructions in our dataflow graph that read data from the PRF are <code>fma</code> and <code>vmovups</code>, and we can expect to execute a maximum of 3 per cycle. Each of our <code>fma</code> instructions occupies 3 read ports, and one <code>vmovups</code> 1 port. PRFs usually come with <a href="https://en.wikipedia.org/wiki/Multiplexer" target="_blank">multiplexers</a> that can handle different reading patterns. We know little about the PRF, but we know nothing about any multiplexers that might be in the area. We can generalize this entire structure like this:</p>
+    <img src="./PRF.png" style="width: 100%;" />
+    <p>the multiplexer is responsible for routing the data to the respective pipe. It can also route the same data multiple times, but it only needs one PRF port to read it from the register. Or, if the data is available on the bypass network represented by the dotted input lines into the multiplexers, it does need any PRF reads. We can safely assume for our maximum dispatch of 2 <code>fma</code>s per cycle, the multiplexer will be able to handle the routing. This would bring the instruction count to 175 and our IPS to ~1.28.
+
+    <p>while we are at the hardware level, let's also talk about how data grabbed directly from memory makes it's way here.</p>
+    <p>in the representation above, the <i>Memory Load</i> is heavily abstracted. In reality, data can come from either the Integer Execution Unit (EX) or directly from L1D cache. Early in the <a href="https://en.wikipedia.org/wiki/Instruction_cycle" target="_blank">instruction lifecycle</a>, any required data operand is first put through an <i>Address Generation Unit</i> or AGU, of which we have 3 stored inside the EX, who compute the memory address where the data is. These are separate units that can run in parallel and can be schedued to align with the beginning of our instructions. After we know the address, it is passed to the <i>Load-Store</i> or LS unit to actually read it into cache. Here we have two 256-bit pipes for reading and one 256-bit pipe for writing per cycle.</p>
+    <p>the complexity of the address calculation can also differ. The AGU can handle <i>base + displacement</i>, <i> base + index</i> and <i>displacement</i> only, any <a href="https://en.wikipedia.org/wiki/Addressing_mode" target="_blank">complex addressing mode</a> adds a latency of 1 cycle because they need to be processed by the bigger <i>Algorithmic Logic Unit</i> or ALU, that typically handles normal integers. This would be useful to us if we wanted to get rid of the <code>mov</code> instructions grabbing the pointers into <code>f</code> and simply calculate a <i>base + index + displacement</i> like this:</p>
+    <pre><code>    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r13+rax+448]</code></pre>
+    <p>in order to translate virtual memory into physical memory, we use a <i>Translation Lookaside Buffer</i> or TLB, usually implemented as a form of <i>key-value store</i> where the key is the virtual address and the value is the physical address. Because of size limitations, it cannot store all the possible addresses. The L1D TLB stores 64 entries, L2 TLB stores 2048 entries. We only store the most recent translations. If we miss, we have to <a href="https://en.wikipedia.org/wiki/Page_table" target="_blank">page walk</a>, look up the address in the page table, adding latency.</p>
+    <p>another hardware component, the <i>Prefetcher</i> handles prefetches to reduce cache misses. Both the L1 and L2 caches have their own prefetcher. These function independently from the code, but there exist explicit prefetching instructions we will later use to ensure data is cached. Overall, the LS unit on each core can handle up to 22 in-flight cache misses.</p>
+    <p>modern OSs have different methods for scheduling a queue of processes on the CPU to minimize the amount of time it remains idle. Even in the case a process stalls, another can take it's place and compute until the bottleneck is resolved. This new process could be part of our program if we imploy a form of <a href="https://en.wikipedia.org/wiki/Multiprocessing" target="_blank">multiprocessing</a>, or can be any other process in the queue. Take a look at the <a href="https://en.wikipedia.org/wiki/Scheduling_(computing)" target="_blank">scheduler</a> on  the latest Linux kernel release for battle-tested examples. Note that since version 6.6 the <a href="https://en.wikipedia.org/wiki/Completely_Fair_Scheduler" target="_blank">Completely Fair Scheduler</a> (CFS) has been replaced by the <a href="https://en.wikipedia.org/wiki/Earliest_eligible_virtual_deadline_first_scheduling" target="_blank">Earliest Eligible Virtual Deadline First Scheduler</a> (EEVDF), the documentation is a bit behind.</p>
+
+    <p>the previousely broadcasted values in <code>ymm15-2</code> are inside this register file and don't need to be changed during runtime. At the risk of overflowing the logical registers even more, we can theoretically extend this pipelining to 4 iterations per loop. We'll keep the redundant load instructions for graph clarity:</p>
+    <img src="./datagraph6.png" style="width: 100%;" />
+    <p>this would average 4 <code>FMA</code>s per 5 cycles, not bad. We can expect a full run to take 6+5*25+5 = ~136 cycles. This means a full batch would take \[ (512 * 24 * 4)/4 * 136 = 1253376\] cycles, or 0.272 ms at 4.6GHz. This is a very small amount of time. In order to better benchmark the algorithm, let's work on 516x516 pixel images (512+4). This yields \[((512*512*64)/4)*136 = 570425344\] cycles. At 4.6GHz, this means 124.005 ms with an IPS of 2.38</p> 
+    <p>but while the performance is good, running this would require 4 accumulation registers, one for each convolution iteration, 4 load operations plus the 13 broadcast registers, totalling 21. Even counting hidden registers, we are unlikely to have access to this many of them. And as a general rule of thumb we should always limit ourselves to the registers defined by the ISA.</p>
+
+    <br />
+    <p>before profiling, let's take a look at the control flow graph to get an idea of potential overhead and total branches:</p>
+    <img src="./CFG.png" style="width: 100%;" />
+    <p>each line that doesn't go down means a branch, a CPU prediction and, potentially, a branch miss. The first block <code>.L2</code> after the function entry point is the entry of both the batch loop and the <code>n_out</code> loop. Next node is the <code>m_out</code> loop, followed by a compiler added branch that separates the two unrolled inner loops either implemented using 8-float <code>ymm</code> registers or 4-float <code>xmm</code> SSE registers.</p>
+    <p>this section of the code is never executed. we only looked at the <code>ymm</code> version, but they are equivalent. Given that we did not use explicit intrinsic functions or specify what vectorization extension we want in the compiler, a <code>CPUID</code> syscall was used to get information about support. The presence of both SSE and AVX-256 could be the compiler adding a failsafe.</p>
+    <p>the conditions used for the jump are interesting. Because the compiler shuffles registers a lot, we need an actual debugger like <code>gdb</code> to track the values compared. Here are the values for the first 5 runs:</p>
+    <pre><code>  cmp rcx, r13 ; initial instruction
+  cmp 140737352552448, 140737348333696
+      140737352552449, 140737348333808  +1,   +112, -4218641
+      140737352552705, 140737348333920  +256, +224, -4218785
+      140737352552705, 140737348334032  +0  , +336, -4218673
+      140737352552961, 140737348334144  +256, +448, -4218817
+
+  ; the cmp instruction sets the CF flag if the first operand is bigger
+  ; because the first operand is incremented more, CF is always set 
+  
+  setae cl ; this sets cl to 1 if the CF flag is 0, else cl is 0
+  ; cl is now 1 </code></pre> 
+  <p>the <code>CF</code>, or <i>Carry Flag</i> is a single bit, part of the <a href="https://en.wikipedia.org/wiki/FLAGS_register" target="_blank">FLAGS register</a>. The <code>ZF</code> or <i>Zero Flag</i> is also in this register. We only jump if both <code>cl</code> and another 8-byte register are both 0:</p>
+  <pre><code>  or sil, cl ; clears OF, CF, sets SF, ZF, PF
+  je .L9     ; only jump if ZF is set </code></pre>
+  <p>since <code>cl</code> is always 1, never jump. the second possible jump:</p>
+  <pre><code>  cmp rax, r14
+  cmp 140737348334080, 140737352552464              -4218384
+      140737348334192, 140737352552560  +112, +96,  -4218368
+      140737348334304, 140737352552656  +224, +192, -4218352
+      140737348334416, 140737352552752  +336, +288, -4218336
+      140737348334528, 140737352552848  +448, +384, -4218320
+
+  ; in this case rax is smaller then r14
+  ; the distance is closing by 16 bytes
+      
+  setae al ; same as above 
+
+  ; but we only ever jump if al is equal to 0
+
+  test al, al ; this does a bitwise AND and updates the ZF
+  je .L9      ; only jump if ZF is set </code></pre>
+  <p>but we never end up reaching that point. This doesn't end up hindering performance because the branch predictor would never expect the jump in the first place. It only ends up making the executable file size bigger. Branch prediction algorithms tend to differ in implementation based on microarchitecture. You can read more about it from Agner Fog's <a href="https://www.agner.org/optimize/microarchitecture.pdf" target="_blank">microarchitecture of Intel, AMD and VIA CPUs</a>.</p>
+    <br /><br />
+    <h4>profiling</h4>
+    <p>we've made a lot of guesses and assumptions about how the above asm will run on hardware. Let's actually test it out with <a href="https://perf.wiki.kernel.org/index.php/Main_Page" target="_blank">perf</a>. A short runtime cannot be benchmarked well, so we'll focus on the 516x516 images. Starting with a simple <code>perf stat</code>:</p>
+    <pre><code>            939.49 msec task-clock                #    0.999 CPUs utilized 
+                10      context-switches          #   10.644 /sec         
+                 0      cpu-migrations            #    0.000 /sec        
+           395,397      page-faults               #  420.861 K/sec       
+     4,040,664,781      cycles                    #    4.301 GHz         
+       426,071,600      stalled-cycles-frontend   #   10.54% frontend cycles idle
+     1,365,582,367      stalled-cycles-backend    #   33.80% backend cycles idle 
+     3,483,067,228      instructions              #    0.86  insn per cycle      
+                                                  #    0.39  stalled cycles per insn
+       432,913,143      branches                  #  460.794 M/sec               
+        46,838,132      branch-misses             #   10.82% of all branches     
+     2,627,287,887      L1-dcache-loads           #    2.796 G/sec               
+        59,443,914      L1-dcache-load-misses     #    2.26% of all L1-dcache accesses 
+   &lt;not supported&gt;      LLC-loads                                                             
+   &lt;not supported&gt;      LLC-load-misses </code></pre>
+
+    <p>longer runtime then expected, more explicitly:</p>
+    <pre><code>       914,179,746 ns   duration_time                                 ( +-  0.22% )
+       611,075,995 ns   system_time                                   ( +-  0.24% )
+       301,904,726 ns   user_time                                     ( +-  0.49% ) </code></pre>
+    <p>where <code>system_time</code> tracks code ran in <a href="https://stackoverflow.com/questions/1311402/what-is-the-difference-between-user-and-kernel-modes-in-operating-systems" target="_blank">kernel mode</a>, or <a href="https://en.wikipedia.org/wiki/Protection_ring" target="_blank">protection ring 0</a>, and <code>user_time</code> tracks code ran in <i>user mode</i> or protection ring 3. Our above asm doesn't rely on any syscalls so it mostly ran in user mode, with the possible exception of kernel intervention in the case of unexpected signals. This means, with control flow, we average ~300ms. This is most similar to our 2 <code>fma</code> loop, meaning the CPU most likely ran 2 loop iterations at once. With \((512*512*64))/2)*136\), or 1140850688 cycles, at 4.3 GHz a runtime of ~265.3ms.</p>
+    <p>execution time is dependent on variable clock speed, resulting in a bigger standard deviation between executions, user time is at ~.5%. For a more accurate measurement let's look at exact number of cycles and instructions. Counters suffixed with <code>:u</code> only measure user mode and with <code>:k</code> only kernel mode. No suffix is total:</p>
+    <pre><code>     4,035,083,395      cycles                                        ( +-  0.06% )
+     1,246,281,485      cycles:u                                      ( +-  0.04% )
+     2,783,423,550      cycles:k                                      ( +-  0.08% )
+     3,516,820,355      instructions       #    0.87  insn per cycle  ( +-  0.01% )
+     1,561,793,587      instructions:u     #    1.25  insn per cycle  ( +-  0.00% )
+     1,955,045,591      instructions:k     #    0.70  insn per cycle  ( +-  0.02% )</code></pre>
+    <p>it automatically calculated the instructions per cycle (IPC) for us. We are at ~1.25 IPC. If we compare to our previousely computed IPC values, we are again close to the 2 iterations per cycle at 1.28 IPC. We can annotate each instruction with the number of cycles it ran:</p>
+    <pre style="overflow-y: scroll; height: 500px;"><code>            │2a9:   vmovups      0x0(%r13,%rax,1),%ymm0
+   19935745 │       vfmadd213ps  (%rdx,%rax,1),%ymm15,%ymm0
+   21064722 │       mov          -0x28(%rsp),%rbx          
+   21024866 │       vmovups      %ymm0,(%rdx,%rax,1)       
+    3329571 │       vfmadd231ps  (%r15,%rax,1),%ymm14,%ymm0
+            │       vmovups      %ymm0,(%rdx,%rax,1)       
+   18819871 │       vfmadd231ps  (%r8,%rax,1),%ymm13,%ymm0 
+            │       vmovups      %ymm0,(%rdx,%rax,1)       
+    2190819 │       vfmadd231ps  (%rdi,%rax,1),%ymm12,%ymm0
+            │       vmovups      %ymm0,(%rdx,%rax,1)       
+    7761848 │       vfmadd231ps  (%rsi,%rax,1),%ymm11,%ymm0
+            │       vmovups      %ymm0,(%rdx,%rax,1)       
+    2221530 │       vfmadd231ps  (%rcx,%rax,1),%ymm10,%ymm0
+    1090240 │       vmovups      %ymm0,(%rdx,%rax,1)       
+   19928532 │       vfmadd231ps  (%rbx,%rax,1),%ymm9,%ymm0 
+            │       mov          -0x20(%rsp),%rbx          
+            │       vmovups      %ymm0,(%rdx,%rax,1)       
+    4433909 │       vfmadd231ps  (%rbx,%rax,1),%ymm8,%ymm0 
+    4442593 │       mov          -0x18(%rsp),%rbx          
+            │       vmovups      %ymm0,(%rdx,%rax,1)       
+    2222789 │       vfmadd231ps  (%rbx,%rax,1),%ymm7,%ymm0 
+            │       mov          -0x10(%rsp),%rbx          
+   16646526 │       vmovups      %ymm0,(%rdx,%rax,1)       
+    3327201 │       vfmadd231ps  (%rbx,%rax,1),%ymm6,%ymm0 
+            │       mov          -0x8(%rsp),%rbx           
+            │       vmovups      %ymm0,(%rdx,%rax,1)       
+    4437493 │       vfmadd231ps  (%rbx,%rax,1),%ymm5,%ymm0 
+    4408350 │       mov          (%rsp),%rbx              
+            │       vmovups      %ymm0,(%rdx,%rax,1)      
+    5529617 │       vfmadd231ps  (%rbx,%rax,1),%ymm4,%ymm0
+   14406060 │       mov          0x8(%rsp),%rbx           
+            │       vmovups      %ymm0,(%rdx,%rax,1)      
+    2220403 │       vfmadd231ps  (%rbx,%rax,1),%ymm3,%ymm0
+    1111934 │       mov          0x10(%rsp),%rbx          
+            │       vmovaps      -0x58(%rsp),%ymm1        
+            │       vmovups      %ymm0,(%rdx,%rax,1)      
+    8869069 │       vfmadd231ps  (%rbx,%rax,1),%ymm2,%ymm0
+    1110835 │       mov          0x18(%rsp),%rbx          
+   15510103 │       vmovups      %ymm0,(%rdx,%rax,1)         
+    6654786 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0   
+    4450204 │       mov          0x20(%rsp),%rbx             
+            │       vmovaps      0x188(%rsp),%ymm1           
+            │       vmovups      %ymm0,(%rdx,%rax,1)         
+   25503474 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0   
+   41043248 │       mov          0x28(%rsp),%rbx             
+            │       vmovaps      0x168(%rsp),%ymm1           
+            │       vmovups      %ymm0,(%rdx,%rax,1)        
+   41032959 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0  
+   35496073 │       mov          0x30(%rsp),%rbx             
+            │       vmovaps      0x148(%rsp),%ymm1          
+            │       vmovups      %ymm0,(%rdx,%rax,1)        
+   55430343 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0  
+   36557312 │       mov          0x38(%rsp),%rbx            
+            │       vmovaps      0x128(%rsp),%ymm1          
+            │       vmovups      %ymm0,(%rdx,%rax,1)        
+   54343004 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0  
+   23301425 │       mov          0x40(%rsp),%rbx            
+            │       vmovaps      0x108(%rsp),%ymm1          
+            │       vmovups      %ymm0,(%rdx,%rax,1)       
+   46562715 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0 
+   42099072 │       mov          0x48(%rsp),%rbx           
+            │       vmovaps      0xe8(%rsp),%ymm1          
+            │       vmovups      %ymm0,(%rdx,%rax,1)      
+   53230580 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0
+   <b>57640664 │       vmovups      %ymm0,(%rdx,%rax,1)</b>      
+   54347370 │       mov          0x50(%rsp),%rbx          
+            │       vmovaps      0xc8(%rsp),%ymm1         
+            │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0
+   47688482 │       mov          0x58(%rsp),%rbx         
+            │       vmovaps      0xa8(%rsp),%ymm1        
+            │       vmovups      %ymm0,(%rdx,%rax,1)        
+   56525529 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0 
+   34376712 │       mov          0x60(%rsp),%rbx              
+            │       vmovaps      0x88(%rsp),%ymm1             
+            │       vmovups      %ymm0,(%rdx,%rax,1)           
+   48804709 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0      
+   29955169 │       vmovaps      0x68(%rsp),%ymm1            
+            │       vmovups      %ymm0,(%rdx,%rax,1)          
+   48781630 │       vfmadd231ps  (%r10,%rax,1),%ymm1,%ymm0   
+   34421537 │       vmovups      %ymm0,(%rdx,%rax,1)        
+  <b> 58746184 │       add          $0x20,%rax</b>                 
+            │       cmp          $0x800,%rax                
+            │     ↑ jne          2a9                        </code></pre>
+    <p>notice the bottlenecks at the end. Also note <code>perf</code> uses the linux default <a href="https://imada.sdu.dk/u/kslarsen/dm546/Material/IntelnATT.htm#:~:text=The%20direction%20of%20the%20operands,second%20operand%20is%20the%20destination." target="_blank">AT&T assembly syntax</a>. The instructions that have been bolded all took more then 5% of the total amount of cycles individually. These correlate almost exactly with L1D cache misses:</p>
+    <pre style="overflow-y: scroll; height: 300px;"><code>            │2a9:   vmovups      0x0(%r13,%rax,1),%ymm0
+     411722 │       vfmadd213ps  (%rdx,%rax,1),%ymm15,%ymm0    
+     308326 │       mov          -0x28(%rsp),%rbx              
+     295976 │       vmovups      %ymm0,(%rdx,%rax,1)           
+      32964 │       vfmadd231ps  (%r15,%rax,1),%ymm14,%ymm0    
+            │       vmovups      %ymm0,(%rdx,%rax,1)           
+     212195 │       vfmadd231ps  (%r8,%rax,1),%ymm13,%ymm0     
+            │       vmovups      %ymm0,(%rdx,%rax,1)           
+      49213 │       vfmadd231ps  (%rdi,%rax,1),%ymm12,%ymm0    
+            │       vmovups      %ymm0,(%rdx,%rax,1)           
+            │       vfmadd231ps  (%rsi,%rax,1),%ymm11,%ymm0    
+      32937 │       vmovups      %ymm0,(%rdx,%rax,1)           
+      32290 │       vfmadd231ps  (%rcx,%rax,1),%ymm10,%ymm0    
+            │       vmovups      %ymm0,(%rdx,%rax,1)           
+     310704 │       vfmadd231ps  (%rbx,%rax,1),%ymm9,%ymm0     
+      15672 │       mov          -0x20(%rsp),%rbx              
+            │       vmovups      %ymm0,(%rdx,%rax,1)           
+      33173 │       vfmadd231ps  (%rbx,%rax,1),%ymm8,%ymm0     
+      31573 │       mov          -0x18(%rsp),%rbx             
+            │       vmovups      %ymm0,(%rdx,%rax,1)          
+      32478 │       vfmadd231ps  (%rbx,%rax,1),%ymm7,%ymm0    
+      18529 │       mov          -0x10(%rsp),%rbx             
+     277959 │       vmovups      %ymm0,(%rdx,%rax,1)          
+      99592 │       vfmadd231ps  (%rbx,%rax,1),%ymm6,%ymm0    
+            │       mov          -0x8(%rsp),%rbx              
+            │       vmovups      %ymm0,(%rdx,%rax,1)          
+      81671 │       vfmadd231ps  (%rbx,%rax,1),%ymm5,%ymm0    
+      64154 │       mov          (%rsp),%rbx                  
+            │       vmovups      %ymm0,(%rdx,%rax,1)        
+      36131 │       vfmadd231ps  (%rbx,%rax,1),%ymm4,%ymm0   
+     342337 │       mov          0x8(%rsp),%rbx            
+            │       vmovups      %ymm0,(%rdx,%rax,1)      
+     115567 │       vfmadd231ps  (%rbx,%rax,1),%ymm3,%ymm0
+      17432 │       mov          0x10(%rsp),%rbx         
+            │       vmovaps      -0x58(%rsp),%ymm1      
+            │       vmovups      %ymm0,(%rdx,%rax,1)   
+      84685 │       vfmadd231ps  (%rbx,%rax,1),%ymm2,%ymm0     
+      66578 │       mov          0x18(%rsp),%rbx              
+     263973 │       vmovups      %ymm0,(%rdx,%rax,1)         
+     114712 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0  
+      65940 │       mov          0x20(%rsp),%rbx           
+            │       vmovaps      0x188(%rsp),%ymm1        
+            │       vmovups      %ymm0,(%rdx,%rax,1)     
+     409424 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0     
+     604652 │       mov          0x28(%rsp),%rbx              
+            │       vmovaps      0x168(%rsp),%ymm1           
+      16251 │       vmovups      %ymm0,(%rdx,%rax,1)        
+    1018632 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0 
+     620862 │       mov          0x30(%rsp),%rbx          
+            │       vmovaps      0x148(%rsp),%ymm1       
+            │       vmovups      %ymm0,(%rdx,%rax,1)    
+     872968 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0  
+     887909 │       mov          0x38(%rsp),%rbx           
+            │       vmovaps      0x128(%rsp),%ymm1        
+            │       vmovups      %ymm0,(%rdx,%rax,1)     
+     846318 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0    
+     508933 │       mov          0x40(%rsp),%rbx             
+            │       vmovaps      0x108(%rsp),%ymm1          
+            │       vmovups      %ymm0,(%rdx,%rax,1)       
+     996104 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0  
+     454671 │       mov          0x48(%rsp),%rbx           
+            │       vmovaps      0xe8(%rsp),%ymm1         
+            │       vmovups      %ymm0,(%rdx,%rax,1)     
+     675173 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0  
+     686926 │       vmovups      %ymm0,(%rdx,%rax,1)       
+     785595 │       mov          0x50(%rsp),%rbx          
+            │       vmovaps      0xc8(%rsp),%ymm1        
+            │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0  
+     814627 │       mov          0x58(%rsp),%rbx           
+            │       vmovaps      0xa8(%rsp),%ymm1         
+            │       vmovups      %ymm0,(%rdx,%rax,1)     
+     725484 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0   
+     539973 │       mov          0x60(%rsp),%rbx            
+            │       vmovaps      0x88(%rsp),%ymm1          
+            │       vmovups      %ymm0,(%rdx,%rax,1)     
+     920001 │       vfmadd231ps  (%rbx,%rax,1),%ymm1,%ymm0 
+     510993 │       vmovaps      0x68(%rsp),%ymm1          
+            │       vmovups      %ymm0,(%rdx,%rax,1)       
+     735113 │       vfmadd231ps  (%r10,%rax,1),%ymm1,%ymm0 
+     667350 │       vmovups      %ymm0,(%rdx,%rax,1)       
+     919375 │       add          $0x20,%rax               
+            │       cmp          $0x800,%rax             
+            │     ↑ jne          2a9                    </code></pre>
+    <p>most <code>vfmadd231ps</code> miss data cache. Of the three operands, two are loaded into registers and don't use the data pipeline. The third pointer operand is responsible for all the misses. All but one <code>mov</code> instruction miss too, at points even more often. One of the highest miss rates is for the last <code>add</code> instruction.</p>
+    <br />
+    <p>it's worth taking the time to discuss how we arrive at the above numbers. Most modern chips include special hardware registers called <a href="https://en.wikipedia.org/wiki/Hardware_performance_counter" target="_blank">Hardware Performance Counters</a> (HPCs) or <i>Performance Monitoring Counters</i> (PMCs). Their role is to increment every time another hardware component is in use. A simple example would be the clock, where it increments on every cycle pulse. PMCs can either be fixed to a single component or programmable to multiple. To control which event we track, every such register comes with a <i>configuration register</i> that serves as the interface.</p>
+    <p>grouped together these registers form the <a href="https://en.wikipedia.org/wiki/Hardware_performance_counter" target="_blank">Performance Monitoring Unit</a> or PMU. PMUs are implemented as <a href="https://en.wikipedia.org/wiki/Model-specific_register" target="_blank">Model-Specific Registers</a> (MSRs) and vary eor each CPU. The x86 ISA defines the instructions <a href="https://www.felixcloutier.com/x86/wrmsr" target="_blank">WRMSR</a> for writing and <a href="https://www.felixcloutier.com/x86/rdmsr" target="_blank">RDMSR</a> for reading from such registers. Some counters can also be accessed by the <a href="https://www.felixcloutier.com/x86/rdpmc" target="blank">RDPMC</a> instruction. The number of PMCs is usually small, for the processor at hand there are only 6, but we have a lot of events we can track with them, usually described in the vendor documentation. Such events can be tracked in parallel, resulting in the PMCs being multiplexed. This reprogramming during execution adds overhead.</p>
+    <p>throughout the lifespan of a longer program, these registers overflow, resulting in an interrupt. Such interrupts can be tracked in software, and together with metadata like the <a href="https://en.wikipedia.org/wiki/Program_counter" target="_blank">instruction pointer</a> (IP), they can keep track of where the program is at a stable interval. This is called <a href="https://www.brendangregg.com/blog/2014-06-22/perf-cpu-sample.html" target="_blank">sampling</a>. The interval can be manually set by initializing the PMU to a known value. For example, if we wanted to count every 100ms at 4.6GHz and the counter was 32 bits wide, we would initialize it to a value of 0xffffffff - 0x0491d72a (76666666 decimal), the highest possible value minus the number of cycles in 100ms.</p>
+    <p>user space tools such as <code>perf record</code> can record samples at a specific rate per second, given in Hz and <code>perf report</code> displays it nicely like above. The event is chosen given it's vendor specific hex value and a hex mask. <code>perf</code> attaches text labels to these values to make them easier to use. <code>perf list --details</code> gives each label's hex values.</p>
+    <p>keep in mind the counters are exposed to a noisy environment. Different iterations of <code>perf record</code> can vary quite a bit. For example, the same process can be fed differently to the CPU from the scheduler depending on other running processes, once the data is dispatched to hardware, the CPU might choose to schedule the instructions differently depending on other running threads, availability of data, etc. This is not to mean that process execution is not deterministic. We could reduce the noise by doing stuff like disabling simultaneous multithreading (SMT), frequency scaling, etc. Find more ways <a href="https://easyperf.net/blog/2019/08/02/Perf-measurement-environment-on-Linux" target="_blank">here</a>.</p>
+    <br />
+    <p>let's take a look at the cache structure. We'll keep counters to user time for now, and later look at an <code>strace</code>. The second call below is to event <code>0x60</code> with mask <code>0xc8</code> to get the total L2 cache accesses from L1D misses. The label used by <code>perf</code> is <code>l2_cache_accesses_from_dc_misses</code>, but we'll use the hex for clarity. We feed this to <code>perf</code> as r[mask][event]:</p>
+    <pre><code>     perf stat -e r40,rc860,r7064,r0864 ./a.out</code></pre>
+    <pre><code>     1,841,496,575      r40:u    - L1 Data Cache Accesses 
+        29,525,366      rc860:u  - L2 Cache Accesses from L1 Data Cache Misses 
+        28,569,645      r7064:u  - L2 Cache Hits from L1 Data Cache Misses 
+         8,656,247      r0864:u  - L2 Cache Misses from L1 Data Cache Misses </code></pre>
+    <p>only 0.47% of data accesses miss the L2 cache. I've been unable to find any decent L3 events in the AMD documentation, but we'll see explicit DRAM accesses later. Let's look at prefetches:</p>
+    <pre><code>        15,706,530      r0260:u  - L2 prefetches 
+         7,373,473      rff70:u  - L2 prefetch hit in L2
+            72,700      rff71:u  - L2 prefetcher hits in L3
+         7,404,641      rff72:u  - L2 prefetcher misses in L3
+
+             1,327      r0152:u  - Software PREFETCH instruction saw a DC hit 
+        11,332,679      r015a:u  - Hardware Prefetch Data Cache Fills by L2
+           101,799      r025a:u  - Hardware Prefetch Data Cache Fills by 
+                                   another cache (home node local)
+           800,413      r085a:u  - Hardware Prefetch Data Cache Fills by 
+                                   DRAM (home node local) </code></pre>
+    <p>note these are averaged over 200 separate runs and not multiplexed. Also note the first 4 trackers include both data and instruction cache. We only care about the data cache for now. Hardware prefetches are executed by the Prefetcher components on the CPU, while software prefetches are instructions inserted by the programmer or compiler. We haven't used them much. Hardware prefetches have less overhead. We can see that most hit in L2, but ~800.000 had to fill from DRAM. Since these are prefetches they are not as likely to halt the process in wait of data, but they do total a cumulative ~50ms at 66ns latency.</p>
+    <p>x86 defines the <a href="https://c9x.me/x86/html/file_module_x86_id_252.html" target="_blank">prefetchh</a> instruction that takes the <code>T0</code> hint for temporal data prefetched in all cache levels, <code>T1</code> hint for first-level cache, <code>T2</code> hint for second-level cache and <code>NTA</code> hint to <i>prefetch data into non-temporal cache structure and into a location close to the processor, minimizing cache pollution</i>. The x86 ISA does not specify how to implement the <code>NTA</code> hint, so it's microarchitecture dependent. There is also a <code>prefetchw</code> instruction for prefetching an address we are going to write to. Each of these instructions fetch one cache line from memory, the size of which is also microarchitecture dependent. For this CPU, the cache line is 64 bytes for all levels.</p> 
+    <p>since software prefetches do have more overhead compared to hardware ones, you should avoid manually prefetching in a place where the hardware would have done it anyway. Linear memory access streams or evenly strided ones are often properly prefetched. Non-regular access patterns, like an sgemm, are not usually handled correctly. There are also some cases where there are too many different streams for the hardware to keep track of, in which case manual prefetching can help. If unsure, profile with <code>perf</code> or similar tools.</p>
+    <p>in our case, we handle a sub-matrix of length 12 and 5 rows, where each row is separated by a stride in linear memory. As the source tensor gets bigger, this stride gets larger and becomes more difficult to handle. Bigger stride means potential cache misses, TLB misses or page faults. If the stride is big enough, each of our rows might be in different pages. This is not a very common pattern, and is generally augmented with software prefetches. One cache line of 64 bytes gives us 16 single precision values, which is enough to cover our length of 12. Some implementations take this even further and copy the data linearly into a memory buffer to access it efficiently. This technique is called <i>packing</i>. I've gone over it in my <a href="https://riemani.ca/blisgemm" target="_blank">previous post</a> about sgemms.</p>
+    <p>we can look at the number of demand data cache fills to know how many requests had to be made for data not found in the cache:</p>
+    <pre><code>            53,655      r0243:u  - Demand Data Cache Fills by Hit in cache; 
+                                   local CCX (not Local L2), or Remote CCX and the 
+                                   address's Home Node is on this thread's die
+         1,507,027      r0143:u  - Demand Data Cache Fills by Local L2 hit 
+            19,610      r0843:u  - Demand Data Cache Fills by DRAM or IO </code></pre>
+    <p>we have a relatively low number of fills from DRAM or IO. If they are all DRAM hits this puts us at only ~1.29ms or at 4.3GHz, 5565318 cycles. Most misses hit in L2.</p>
+    <p>now let's look at the L1 and L2 data TLB:</p>
+    <pre><code>         1,261,477      rff45:u  - All L1 DTLB Misses or Reloads 
+            72,632      r0145:u  - DTLB reload to a 4K page that hit  in the L2 TLB 
+         1,185,878      r1045:u  - DTLB reload to a 4K page that miss in the L2 TLB
+
+         1,188,991      rf045:u  - L2 DTLB Misses & Data page walks </code></pre>
+    <p>we miss a lot of TLB loads and page walk. Unfortunately, the only TLB specific instruction x86 defines is <a href="https://www.felixcloutier.com/x86/invlpg" target="_blank">invlpg</a>, used to invalidate entries. We can force an entry by a software prefetch. Hardware preferches are not allowed to execute prefetches into different pages because they might initiate table walks that are invalid. In order to lower misses, we need to better control memory access patterns.</p>
+
+    <br />
+    <p>let's talk a bit about virtual memory pages and efficient access patterns. Keep in mind this might be OS dependent. For this example, we are looking at linux 6.5.0-41-generic. For a primer in the linux memory management system or general virtual memory, check out <a href="https://tldp.org/LDP/tlk/mm/memory.html" target="_blank">this</a>.</p>
+    <p>the virtual memory space is split into smaller chunks called <a href="https://en.wikipedia.org/wiki/Page_(computer_memory)" target="_blank">pages</a> for easier management. The size of a page is usually 4KB, or 4096 bytes. The same is done for physical memory. To keep track of the mapping of one virtual memory page onto a physical memory page, we assign each a number called the <i>page frame number</i> (FPN) and we keep a table. A virtual frame could be pointing to any physical frame. A virtual memory address contais a page number and an offset into that page. When an instruction requests data from such a virtual address, the CPU needs to translate it into the relevant position in physical memory.</p>
+    <p>at this stage the CPU tries to find this mapping by checking for the virtual page number in the L1 TLB, usually implemented as a <a href="https://en.wikipedia.org/wiki/Hash_table" target="_blank">hash map</a> in SRAM. If we hit, we can translate and begin loading data in ~0.5-1 cycles. If we miss, we search the L2 TLB. If we also miss here, we have to <i>page walk</i>, go through the <i>Page Table</i> stored in main memory (DRAM) to find the relevant physical page. For Zen 2, a main memory access has a 38 cycles + 66ns latency, plus the latency of the table search. If the mapping is found, the data is loaded into the TLB and the CPU restarts the instruction. If a mapping is not found, we have hit a <i>page fault</i>. Here, we check if the virtual address is valid. If it is not, the OS kills the process to protect other processes. If it is valid, we have to load the page from disk, a very long process.</p>
+    <p>because we are dealing with a relatively small amount of data, all of it fits in DRAM and we don't have to deal with page faults. If, for example, we were dealing with a bigger resolution images or we had a smaller amount of available DRAM (average in a mobile phones is ~4GB), we would have to consider the possibility. We handle ~1.08 GB, or 1,082,163,300 bytes for single precision.</p>
+    <p>simple TLBs only store the most recent translated pages and discard older ones. Modern TLBs have more advanced eviction policies. A search in the TLB compares the page number of the virtual address with virtual page numbers stored in the cache. Multiple searches in the same page hit the same entry in the TLB. It follows that an efficient access pattern is one that reuses the same cache entries as much as possible. For this reason, the size of a page can sometimes be changed. Most x86 processors support 4KiB, 2MiB or 1GiB pages. This is determined by a hardware component called the <a href="https://en.wikipedia.org/wiki/Memory_management_unit" target="_blank">Memory Management Unit</a> or MMU. Read more about changing page size on linux <a href="https://lwn.net/Articles/374424/" target="_blank">here</a>. Also take a look at <a href="https://pvk.ca/Blog/2014/02/18/how-bad-can-1gb-pages-be/" target="_blank">this experiment</a> to better understand pages. We won't be changing page size.</p>
+
+    <br />
+    <p>let's model the TLB entries of our code. Each kernel call we manage a 12x5 sub-matrix. A single cache line per row loads 16 values, enough to cover the 12 columns. This puts us at 5 cache lines. We also load 11 32-byte broadcasted filter variables and 17 4-byte addresses. This gives us another 6 and 2 cache lines respectively, adding to 13. We also have a write instruction that fills the output array, address we need to fetch into memory. So 14 cache lines total.</p>
+    <p>every cache line loaded from a different page is stored as an entry in the TLB. The 5 lines from the sub-matrix are separated by a stride \(S\) given by the size of the images. In the present case of 516x516, the stride is 516 floats, or 2064 bytes. Considering 4KiB pages of 4096 bytes each, this only gives us one or two hits per page, depending on the displacement of data. The max number of pages used is given by starting at index 4092: \[ \text{ciel}((4092+2064*5)/4096) = \text{ceil}(3.51)\] meaning 4 pages per kernel call. To this we add the filter values and addresses. Since they are stored on the stack, we can consider them in the same page for a total of 5 pages. Lastly, we need to add the write line to the output array in a different page. So each kernel call handles 6 pages.</p>
+    <p>subsequent kernel calls work on sequential memory, so these 6 pages are reused. In the case of the sub-matrix, given we start at the beginning of the page, we can fit ~85 kernel calls of 48-byte (12) displacement in 4096 page bytes until they need to request the next pages. But, since the column size is smaller then a cache line, there is some leftover data. There are only 64 cache lines in a page, and thus only 64 chances to miss. In the case of the write instruction, we can fit ~128 32-byte (8 float) writes. The stack page is consistently reused.
+    <p>we expect 4 misses every 85 calls, for \(512*512*64\) calls and we also add one page fault for the write every 128 calls. We total: \[((512*512*64)/85)*4 + ((512*512*64)/128) = 920,588.04\] page misses at worst. Keep in mind that even though we have 25 different write instructions per kernel call, they all point to the same write address. Of the original 1,188,991 page walks, only ~65.83% are attributed to our function. This would mean ~782,712 page walks. Our prediction is within margin of error. Given 3 pages per sub-matrix (much more likely), we would have 723,209.</p>
+    <p>if we were to pack the sub-matrix data sequantially into memory, we could reduce the average of 3 page misses per ~85 calls to only 1 page miss per ~68 calls. At a main memory latency of 38 + 66ns, we can easily see for a large amount of data it covers the latency of moving the data into the new buffer. It would mean: \[((512*512*64)/68) + ((512*512*64)/128) = 377,795.76\] </p> 
+    <p>number which we could alleviate with well placed software prefetches.</p>
+    <p>this seems to be our biggest bottleneck. A look at <code>perf report --stdio</code> shows the main dependency of our function is <code>asm_exc_page_fault</code>, at 15.26% of our runtime.</p>
+
+    <br /> 
+    <p>I'll manually annotate some of these trackers to get a better view. The percentage in parentheses is the total number of the tracked counters made up by our naive function:</p>
+        <pre><code>       rf045:u - L2 DTLB Misses & Data page walks (65.83%)
+       r0843:u - Demand Data Cache Fills by DRAM or IO (70.86%) 
+       r0864:u - L2 Cache Misses from L1 Data Cache Misses (67.44%)</code></pre>
+        <pre><code>         cycles |   rf045:u |  r0843:u |  r0864:u |
+       ---------|-----------|----------|----------|
+       21186425 |      6534 |      200 |    41966 |  14e0:   vfmadd213ps
+       12315021 |       580 |          |    76442 |  14e6:   mov        
+       11831880 |      5890 |      255 |     3928 |  14fb:   vfmadd231ps
+       12339458 |      5886 |      356 |     2949 |  1527:   vfmadd231ps
+       11842702 |      6308 |      151 |     3280 |  1552:   vmovups    
+        9943971 |      4780 |      240 |     4600 |  157c:   mov        
+        8532289 |      5560 |      128 |     4275 |  15a7:   vmovups   
+       12798017 |      7572 |      445 |     3932 |  15c5:   vfmadd231ps
+       26088788 |      8253 |      210 |     5910 |  15cb:   mov    
+       26913363 |     13695 |      577 |    11135 |  15de:   vfmadd231ps
+       23698430 |      8515 |      790 |     9500 |  15e4:   mov   
+       31903337 |     12451 |      455 |    15763 |  15f7:   vfmadd231ps
+       21300825 |     11440 |      298 |     5238 |  15fd:   mov    
+       31703956 |     16838 |      714 |    10834 |  1610:   vfmadd231ps
+       22117032 |     13021 |      371 |     7218 |  1616:   mov    
+       29790187 |     18273 |      518 |     9846 |  1629:   vfmadd231ps
+       25738146 |     12351 |      388 |     7865 |  162f:   mov   
+       35969861 |     15904 |      630 |     9492 |  1642:   vfmadd231ps 
+       33661792 |     14778 |      876 |     8852 |  1648:   vmovups 
+       35861719 |     13311 |      664 |    14431 |  164d:   mov   
+       34629506 |     14216 |      537 |     6898 |  1661:   mov  
+       34054336 |     15462 |      604 |    11492 |  1674:   vfmadd231ps 
+       23186577 |      8957 |      502 |     5257 |  167a:   mov 
+       32085922 |     16197 |      594 |    12468 |  168d:   vfmadd231ps
+       18457640 |      9950 |      494 |     9847 |  1693:   vmovaps
+       37925127 |     16762 |      891 |    11131 |  169e:   vfmadd231ps
+       22714021 |      8991 |      355 |     6620 |  16a4:   vmovups 
+       28444358 |     17139 |      836 |    13106 |  16a9:   add  </code></pre>
+
+
+
+    <br/>
+    <p>let's also take a look at events tracking the FPU. We can see total FLOPS and \(\mu\)op assignment per pipe:</p> 
+    <pre><code>     6,888,823,080      fp_ret_sse_avx_ops.mac_flops              (36.37%)
+
+     1,163,859,706      ex_ret_mmx_fp_instr.sse_instr             (36.81%)
+                26      fp_disp_faults.ymm_fill_fault             (37.25%)
+                16      fp_disp_faults.ymm_spill_fault            (37.35%)
+
+     1,209,644,176      fpu_pipe_assignment.total                 (46.28%)
+       295,844,295      fpu_pipe_assignment.total0                (45.84%)
+       281,644,302      fpu_pipe_assignment.total1                (54.74%)
+       564,730,678      fpu_pipe_assignment.total2                (54.29%)
+        70,654,705      fpu_pipe_assignment.total3                (53.85%)
+
+        22,441,966      fp_num_mov_elim_scal_op.sse_mov_ops       (53.40%) </code></pre>
+    <p>as expected pipe 0 and 1 did most of the computation. Pipe 2 was responsible for writing to disk. During kernel calls, we have a total of: \[512*512*64*25 = 419,430,400\] writes to disk from the repeated <code>vmovups</code> instructions. Pipe 3 was mostly idle, given that pipe 0 and 1 were using it's read ports for <code>fma</code> instructions. <code>fp_ret_sse_avx_ops.mac_flops</code> tracks the total number of FLOPs by multiply-accumulate instructions, or <code>fma</code>. Each such instruction counts as 2 operations, a multiply and an accumulate.</p>
+    <br />
+    <p>given all of this, let's simulate the best theoretical convolution algorithm on this system, optimised specifically for this CPU.</p>
+
+    <br /> <br />
+    <h4>theoretical maximum</h4>
+    <p>we'll be keeping the same vectorization method from the naive implementation. It offers a good sequential read pattern and helps us avoid the odd size of the filter matrix commonly encountered in convolutions. It is also the method most frequently found in the relevant scientific literature.</p>
+    <p>we start by limiting the number of <code>fma</code> instructions to 2 per cycle:</p>
+    <img src="./datagraph3.png" style="width: 100%;" />
+    <p>let's calculate how much data we load in the 0th cycle. One <code>vmovaps</code> loads 32 bytes and one <code>mov</code> loads 8 bytes. This puts us at 32*2+8*2 = 80 bytes loaded from memory. We are capped at 64 bytes of load per cycle both by the LS unit and the PRF. We can remove the <code>mov</code> instructions by using complex addressing. We change:</p>
+    <pre><code>    lea rax, 448[r13]
+    mov QWORD PTR 88[rsp], rax
+    [ . . . ]
+    mov r9, QWORD PTR 88[rsp]
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r9+rax] </code></pre>
+    <p>to:</p>
+    <pre><code>    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r13+rax+448]</code></pre>
+    <p>we can also skip the filter stack variables and change the <code>vmovaps</code> instructions into <code>vbroadcastss</code>. The stack variables were used in the hopes of avoiding cache misses. If we decide to skip them, we have to insert software prefethes to insure the data is in the cache and the virtual page in the TLBs. We change:</p>
+    <pre><code>    vbroadcastss  ymm0, DWORD PTR 76[r12]
+    vmovaps YMMWORD PTR 264[rsp], ymm0
+    [ . . . ]
+    vmovaps ymm1, YMMWORD PTR 264[rsp]
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [rbx+rax] </code></pre>
+    <p>to:</p>
+    <pre><code>    vbroadcastss  ymm1, DWORD PTR 76[r12]
+    vfmadd231ps ymm0, ymm1, YMMWORD PTR [r13+rax+448]</code></pre>
+    <p>we can prefetch the 25 filter values before the beginning of the kernel call in two cache lines like this:</p>
+    <pre><code>    prefetch0 [r12]      ; 64 bytes,  0 - 16 
+    prefetch0 64[r12]    ; 64 bytes, 16 - 32 </code></pre>
+    <p>using the <code>T0</code> hint to load into all cache levels. This way even if we wanted to iterate through different filter channels, we would still likely hit in L2, or in the worst case in L3, when looping back to the first channel. At the same time, this updates both TLBs with the virtual page number of the filter addresses. Even in the case of, let's say, 64 channels, they would still fit inside two virtual pages, so multiple prefetches will not overwrite the TLB. They will ensure the translations persist.</p>
+    <p>we end up with a load of only 8 bytes per cycle:</p>
+    <img src="./dmax1.png" style="width: 100%;" />
+    <p>we have a 4 cycle delay before the first <code>fma</code> instructions are fired, and a further 5 cycle latency before they are done. This means we can only start reusing the designated registers after 9 cycles. To ensure no data dependency between the different <code>fma</code> instructions, we must ensure each has it's own accumulation register. Given the 5 cycle latency, we end up needing 10 accumulation registers before we start reusing them. During this time we continue to broadcast at a rate of 2 <code>vbroadcastss</code> per cycle, filling a further 18 registers for a total of 28. We only have 16 indexable logical registers.</p>
+    <p>furthermore, we have to keep in mind that 2 out of the 4 FPU execution pipes are busy with <code>fma</code> instructions and they both need to borrow the read ports of pipe 3 in order to fetch data from the PRF. This will likely hinder the performance of pipe 3 during runtime, potentially inflicting a one cycle delay and leaving only pipe 2 to <code>vbroadcastss</code> consistently. If we were to trust the numbers, pipe 3 is only stalled for one cycle while the two other pipes grab data. At an <code>fma</code> latency of 5 cycles and <code>vbroadcastss</code> latency of 4 cycles, it is likely to not be very noticeable.</p>
+    <p>we could simply add a couple cycles of delay to allow for registers to be free or schedule a single <code>fma</code> per cycle. We could also interleave two kernel calls together and multiplex the registers to the <code>fma</code>s:</p>
+    <img src="./dmax2.png" style="width: 100%;" />
+    <p>this would half our broadcast registers down to 9, totalling 17 registers. This multiplexing could technically be done on the bypass network without a read from the PRF, potentially lowering the 4 cycle latency. We could continue to interleave 4 kernel calls and get the number of registers under control:</p>
+    <img src="./dmax3.png" style="width: 100%;" />
+    <p>unfortunately we do not have much control over CPU internals, the most we could do is chain asm executions and hope for the best:</p>
+    <pre><code>    vbroadcastss  ymm0, DWORD PTR [r12]
+    vfmadd231ps ymm1, ymm0, YMMWORD PTR [r13+rax+0]
+    vfmadd231ps ymm2, ymm0, YMMWORD PTR [r13+rax+1065024]   ; one image is 1065024 bytes
+    vfmadd231ps ymm3, ymm0, YMMWORD PTR [r13+rax+2130048]   ; roughly 780 pages apart
+    vfmadd231ps ymm4, ymm0, YMMWORD PTR [r13+rax+3195072] </code></pre>
+    <p>and doing it this way drastically increases the complexity of properly caching memory pages. Given we compute 4 loop interations at once, we don't have to handle 4 pages per kernel call, but 4*4 = 16 possible pages at once. Together with 2 pages from the filter and one from the output array, we can round it up to ~20 pages. The L1D TLB holds 64 entries and the L2 holds 2048 entries, so it's far from the limit. Even if we do find it to be a problem, we can solve it by packing the image data into a new sequential buffer.</p>
+    <p>handling the registers correctly is paramount because we do not want to mix values from different iterations. For example, the first iteration starts with one register on cycle 4, followed by another on cycle 6 and another on cycle 8. By cycle 9, we can already reuse the accumulation register from cycle 4 when the next instruction is launched in cycle 10. This means we have to handle 3 accumulation registers per iteration, or 12 total. We also have to account for the <code>vaddps</code> instructions used to add these registers together into the final convolution values, two for each iteration.</p>
+    <p>we can also account for the possibility that the <code>fma</code> output could be fed through the bypass network at a faster rate then 5 cycles, say 4. If this is the case, they could be used by the third instruction for the iteration, meaning we only need to use 2 accumulation registers per iteration, or 8 in total.</p>
+    <p>because of the delayed second batch of <code>fma</code> instructions that depend on <code>vbroadcastss 0</code>, we have to account for 6 cycles of latency before reuse. We launch one broadcast every 2 cycles, meaning 5 per 10 cycles.</p>
+    <br />
+    <p>let's try a simple <a href="https://www.nasm.us/" target="_blank">nasm</a> example to see if this is possible:</p>
+    <pre><code>    global _start
+
+    section .data
+    f: dd 0.69420      ; dummy image luminosity pixel 
+    g: dd 0.54321      ; dummy filter value
+    cnt: dd 0x100000   ; 2^20 iterations
+
+    section .text
+    _start:
+      vbroadcastss ymm0, [f]
+      push rcx
+      mov rcx, [cnt]
+      loop:
+        vbroadcastss ymm1, [g]
+        vfmadd231ps ymm2, ymm1, ymm0  ; use register ymm0 instead of memory access
+        vfmadd231ps ymm3, ymm1, ymm0  ; to remove any potential memory overhead 
+        vfmadd231ps ymm4, ymm1, ymm0  
+        vfmadd231ps ymm5, ymm1, ymm0 
+        dec rcx
+        jnz loop
+      pop rcx
+      ; exit syscall
+      mov rax, 60
+      xor rdi, rdi
+      syscall </code></pre>
+   <p>let's try to run it:</p>
+    <pre><code>         4,968,016      cycles:u                    
+         4,296,864      fpu_pipe_assignment.total   
+         2,092,522      fpu_pipe_assignment.total0  
+         2,092,730      fpu_pipe_assignment.total1  
+           113,014      fpu_pipe_assignment.total2  
+     &lt;not counted&gt;      fpu_pipe_assignment.total3  </code></pre>
+    <p>given \( 2^{20} \)  iterations and a <code>vbroadcastss</code> latency of 4 cycles, this puts us at ~4,194,304 cycles loop runtime. This example manages one <code>fmadd231ps</code> per cycle. Now let's double it:</p>
+    <pre><code>  loop:
+
+    vbroadcastss ymm1, [g]
+    vbroadcastss ymm2, [g]
+
+    vfmadd231ps ymm3, ymm1, ymm0 
+    vfmadd231ps ymm4, ymm1, ymm0 
+    vfmadd231ps ymm5, ymm1, ymm0 
+    vfmadd231ps ymm6, ymm1, ymm0 
+
+    vfmadd231ps ymm7,  ymm2, ymm0 
+    vfmadd231ps ymm8,  ymm2, ymm0 
+    vfmadd231ps ymm9,  ymm2, ymm0 
+    vfmadd231ps ymm10, ymm2, ymm0 
+    dec rcx
+    jnz loop </code></pre>
+    <p>this gives us the desired parallel execution:</p>
+    <pre><code>         4,972,229      cycles:u                    
+         8,497,567      fpu_pipe_assignment.total   
+         4,193,722      fpu_pipe_assignment.total0  
+         4,192,536      fpu_pipe_assignment.total1  
+           112,713      fpu_pipe_assignment.total2  
+                20      fpu_pipe_assignment.total3  </code></pre>
+    <p>note the importance of instruction placement in the asm. If we did not chain the broadcasts together we would add significant overhead:</p> 
+    <pre><code>    vbroadcastss ymm1, [g]
+    vfmadd231ps ymm3, ymm1, ymm0 
+    vfmadd231ps ymm4, ymm1, ymm0 
+    vfmadd231ps ymm5, ymm1, ymm0 
+    vfmadd231ps ymm6, ymm1, ymm0 
+
+    vbroadcastss ymm2, [g]
+    vfmadd231ps ymm7, ymm2, ymm0 
+    vfmadd231ps ymm8, ymm2, ymm0 
+    vfmadd231ps ymm9, ymm2, ymm0 
+    vfmadd231ps ymm10, ymm2, ymm0 </code></pre>
+    <pre><code>         5,191,395      cycles:u  
+         8,457,437      fpu_pipe_assignment.total    
+         4,168,967      fpu_pipe_assignment.total0   
+         4,168,204      fpu_pipe_assignment.total1   
+           121,487      fpu_pipe_assignment.total2   
+     &lt;not counted&gt;      fpu_pipe_assignment.total3   </code></pre>
+
+    <br /><br /> <br /><br />
+    <h4>that's it for now</h4>
+    <p>i'll be implementing these algorithms in C and nasm in part 2.</p>
+    <p>follow <a href="https://x.com/riemannianmani" target="_blank">@riemannianmani</a> on x dot com the everything app for updates</p>
+    <p>dm or email <a href="emailto:chat@riemani.ca">chat@riemani.ca</a> for any errors or questions</p>
+
+
+  </body>
+</html>
