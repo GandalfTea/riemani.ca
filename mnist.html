@@ -95,6 +95,21 @@
       <p>some text describing this functio \( S(a) : \mathbb{R}^N \rightarrow \mathbb{R}^N \) : </p>
       <p>the functions is lit. that's why we do : </p>
       <p>\[ \frac{\partial \mathcal{L}}{\partial z_j} = - \sum_{i=0}^{c} \frac{y_i}{s_i} * s_i * (1\{i=j\}-s_j) = - \sum_{i=0}^c y_i * (1\{i=j\}-s_j) \]</p>
+
+      <br /> <br /> <br />
+      <details>
+        <summary>deriving the softmax equation</summary>
+        <br/>
+        <p> we define <code>softmax</code> as a function \( \varphi(x) : \mathbb{R}^N \rightarrow \mathbb{R}^N :\) \[ \varphi(x_i) =  \frac{ e^{x_i - \max_x}}{\sum_{j}^N e^{x_j - \max_x}} \] </p>
+        <p> \[ \frac{\partial \varphi(x_i)}{\partial x_n} = \frac{\partial}{\partial x_n} \frac{e^{x_i}}{\sum_{j}^N e^{x_j}} \]</p>
+        <p> if \( i = n\) \[ \begin{aligned}&= \frac{e^{x_i} \sum_{j}^N e^{x_j} - e^{x_i} e^{x_n}}{ (\sum_{j}^N e^{x_j})^2}
+        = \frac{e^x_i}{\sum_{j}^N e^{x_j}} \cdot ( 1- \frac{e^{x_i}}{\sum_{j}^N e^{x_j}}) \\ \\
+        &=\varphi(x_i) \cdot ( 1- \varphi(x_i)) \end{aligned} \]</p>
+        <p> else if \( i \neq n\) </p>
+        <p> \[ \begin{aligned} &= \frac{ 0 \cdot \sum_j^N e^{x_j} - e^{x_i} e^{x_n}} {(\sum_j^N e^{x_j})^2} 
+        = - \frac{e^{x_i}}{\sum_j^N e^{x_j}}  \frac{e^{x_n}}{\sum_j^N e^{x_j}} \\ \\
+        &= - \varphi(x_i) \varphi(x_n) \end{aligned} \] </p>
+      </details>
     </main>
   </body>
 </html>
