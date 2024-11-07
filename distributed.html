@@ -1,0 +1,378 @@
+
+<!DOCTYPE html />
+<html lang='en'>
+  <head>
+    <meta charset="UTF-8" />
+    <link rel='icon' type='image/jpg' href='icon.jpg' />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="in depth dive into the workings of a gotoBLAS/BLIS 8x8 matrix multiplication kernel" />
+    <title>no abstraction mnist convnet</title>
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <style>
+        body {
+          width: 80ch;
+          margin: auto;
+          margin-top: 15vh;
+          font-family: Consolas,Monaco,Lucida Console,Liberation Mono,DejaVu Sans Mono,Bitstream Vera Sans Mono,Courier New;
+          font-size: 12px;
+          margin-bottom: 20vh;
+          line-height: 1.3em;
+        }
+        body pre { line-height: 1.2em; }
+        body li { margin-top: 10px; }
+        body a { color: dodgerblue;}
+        body .thread { color: dodgerblue; text-decoration: none;}
+        body .thread:hover { text-decoration: underline;}
+        body hr { border: 2.5px dotted white; }
+        body p:not(:nth-child(2)) { margin-top: 30px; }
+        body p:nth-child(2) { margin-top: 0px; }
+        body h3:first-child { margin-bottom: 5px; }
+        body h4 { margin-top: 30px; }
+        body h5 { margin: 0px; font-weight: 100; }
+        body table td { width: 120px; text-align: left; }
+        body table th { width: 120px; text-align: left; }
+        body pre { width: 100%; margin-top: 30px; font-size: 10px; background-color:#f6f6f6; border-radius:3px; }
+        body .cache td { width: 150px; }
+        body .cache th { width: 150px; }
+        @media only screen and (max-width: 650px) { 
+          body { width: 90vw !important; } 
+        }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h4>DNN Graphs and Intermediary Representations</h4><br />
+      <h4>1. Problem Definition</h4> 
+
+      <p>given growing model sizes and a higher level of interest in large-scale deployment of DNNs in recent times, a large amount of effort was put into parallelizing the training and inference operations to work across multiple GPUs, either in the same physical location or distributed over a network.</p>
+      <p>multiple levels of parallelization have been tried:</p>
+      <p><b>data paralellism</b> simply loads the same model into multiple GPUs local VRAM and feeds different batches as input, synchronizing the weights for each training step or for an arbitraty \(N\) number of steps. Skipping a global weight update for each steps relies on a weight sharding mechanism introduced in <a href="https://arxiv.org/pdf/2004.13336" target="_blank">[2004.13336]</a>.</p>
+      <p><b>pipeline parallelism</b> splits the model into blocks of one or more layers and dispatches them to different GPUs. To escape the obvious restriction of synchronicity imposed by standard network pipeline, each GPU processes multiple mini-batches at different stages of said pipeline, thus minimizing idle time. This was introduced by <a href="https://arxiv.org/pdf/1806.03377" target="_blank">[1806.03377]</a> and is an extension of <i>model parallelism</i>.</p>
+      <p><b>tensor parallelism</b> splits each tensor of the model into sub-tensors called <i>shards</i> and dispatches shard operations on GPUs. At the end of the training step results are synced. [TODO talk about syncing over N steps and only syncing with close nodes or smth]</p>
+      <p>such distribution of work across nodes and effort for low-communication overhead impedes on the work of network-wide optimisers like AdamW or SGD and have lead researchers to develop specific optimizers for distributed situations. Most commonly used one is <b>ZeRO</b> introduced in <a href="https://arxiv.org/pdf/1910.02054" target="_blank">[1910.02054]</a>.</p>
+
+      <br />
+      <p>distributed computing can be formulated as a <i>graph optimization</i> that attempts to shard an arbitrary model into adequatly sized parts matching the available network topology such that:
+        <ol type="i">
+          <li>it minimizes GPU idle time.</li>
+          <li>employs the adequate amount of communication to evade stalls. This is dependent on the medium of communication, rangeing from nvlink's 1.7TB/s inter-GPU communication in a datacenter to an average of ~250MB/s of TCP network speeds (US).</li>
+        </ol>
+      </p>
+      <p>most commonly used utility to shard an already existing model is PyTorch's <a href="">Fully Sharded Data Parallel</a> (FSDP) implementation inspired by <a href="https://arxiv.org/pdf/2004.13336" target="_blank">[2004.13336]</a> as well as the ZeRO stage 3 optimizer detailed in <a href="https://arxiv.org/pdf/1910.02054v3" target="_blank">[1910.02054]</a>. Before we get into it, a brief overview of the model execution pipeline is in order.</p>
+
+      <br /> <br />
+      <h4>2. Single GPU Execution Pipeline</h4>
+      <p>at it's core a neural network is an unknown function \( f : \mathbb{R} \rightarrow \mathbb{R} \) that produces the desired output. To manage the complexity of this function, we break it down into a <i>computational graph</i> where each node is a sub-function \(g(x)\) that performns a subset of the operations \(f\) does and each edge a data dependency.</p>
+      <p>\[ f = \{ g_0, g_1, \cdots, g_n \} \]</p>
+      <p>we refer to any function \(\delta\) that is homotopic to \(g_i\), a function that reaches the same end point but might have variations in path, as a <i>layer</i> and we use them as named building blocks.</p>
+
+      <p>PyTorch has two modes of operation. The default is <a href="">eager</a>, where function calls are immediately launched through the <a href="">Dispatcher</a> component (implemented as a virtual table) to ATen in c++ where kernels and data are fed to the GPU through a <a href="">torch.cuda.Stream</a>, a wrapper aroung cudaStream_t. While being dispatched, each function stores a <i>Function</i> object containing information necessary for backpropagation in it's <i>grad_fn</i> used by the <i>Autograd</i> engine. Bundled together, this information forms a <a href="">Directed Acyclic Graph</a> (DAG) where leaves are tensors and the roots are the output tensors.</p>
+      <p>Upon calling <i>backward()</i>, the gradients are calculated and the walked nodes of the graph destroyed. The graphing process happens on every epoch, allowing you to use conditional control flow statements to change the logic of the computation. Tensors which do not require gradients are not included. Because of this, the graph cannot be used for optimizations.</p>
+      <p>Basic symbolic tracing can be done using the <a href="">fx</a> module. Calling <i>symbolic_trace</i> on a simple MNIST model performs a symbolic execution feeding the layers fake values using <a href="">fx.Proxies</a> and appending the function calls to a <a href="">fx.GraphModule</a> object. Below is the graph of a simple MNIST network:</p>
+      <pre style="font-size:10px; border:none; background-color:#f6f6f6; border-radius:3px;overflow-x:scroll;"><code>   
+  graph():
+    %x : [num_users=1] = placeholder[target=x]
+    %conv1 : [num_users=1] = call_module[target=conv1](args = (%x,), kwargs = {})
+    %relu : [num_users=1] = call_function[target=torch.nn.functional.relu](args = (%conv1,), kwargs = {inplace: False})
+    %conv2 : [num_users=1] = call_module[target=conv2](args = (%relu,), kwargs = {})
+    %relu_1 : [num_users=1] = call_function[target=torch.nn.functional.relu](args = (%conv2,), kwargs = {inplace: False})
+    %max_pool2d : [num_users=1] = call_function[target=torch.nn.functional.max_pool2d](args = (%relu_1, 2), kwargs = {stride: None, padding: 0, dilation: 1, ceil_mode: False, return_indices: False})
+    %dropout1 : [num_users=1] = call_module[target=dropout1](args = (%max_pool2d,), kwargs = {})
+    %flatten : [num_users=1] = call_function[target=torch.flatten](args = (%dropout1, 1), kwargs = {})
+    %fc1 : [num_users=1] = call_module[target=fc1](args = (%flatten,), kwargs = {})
+    %relu_2 : [num_users=1] = call_function[target=torch.nn.functional.relu](args = (%fc1,), kwargs = {inplace: False})
+    %dropout2 : [num_users=1] = call_module[target=dropout2](args = (%relu_2,), kwargs = {})
+    %fc2 : [num_users=1] = call_module[target=fc2](args = (%dropout2,), kwargs = {})
+    %log_softmax : [num_users=1] = call_function[target=torch.nn.functional.log_softmax](args = (%fc2,), kwargs = {dim: 1, _stacklevel: 3, dtype: None})
+    return log_softmax </code></pre>
+      <p>This object serves as an <a href="">Intermediary Representation</a> (IR), a symbolic collection of objects that hold information on data flow through the program, often used in compilers to perform various hardware-independent optimizations and easily translate into machine instructions. The above is a very high-level representation, but very useful because the underlying <a href="">fx.Graph</a> object can be modified programatically. You can add/remove nodes, change the order, provide a set of rules to decompose nodes into primitive pytorch operations, recompile the graph and transforming it back into runnable python code. In this sense, it functions more like a tensor-level <a href="">Abstract Syntax Tree</a> (AST).</p>
+      <p>More advanced graphs can be constructed using tracing helper functions such as <a href="">__torch_dispatch__</a>, that works below the <i>Dispatcher</i> at a c++ level. For conveniance we are going to focus on the other mode of execution, <a href="">graph</a> that creates a full static graph of the model before execution through the internal JIT compiler. . The particular flavor used is called <a href="">TorchScript</a>. For a simple MNIST model, it looks like this:</p>
+      <pre style="font-size:10px; border:none; background-color:#f6f6f6; border-radius:3px;overflow-x:scroll;"><code>   
+  graph(%self : __torch__.test_torch_conv_mnist.___torch_mangle_58.Net,
+      %x.1 : Tensor):
+  %51 : Function = prim::Constant[name="log_softmax"]()
+  %49 : int = prim::Constant[value=3]()
+  %33 : int = prim::Constant[value=-1]()
+  %26 : Function = prim::Constant[name="_max_pool2d"]()
+  %20 : int = prim::Constant[value=0]()
+  %19 : NoneType = prim::Constant()
+  %7 : Function = prim::Constant[name="relu"]()
+  %6 : bool = prim::Constant[value=0]()
+  %17 : int = prim::Constant[value=2]() # /home/lafiel/work/apex/dispenser/tests/test_torch_conv_mnist.py:27:24
+  %32 : int = prim::Constant[value=1]() # /home/lafiel/work/apex/dispenser/tests/test_torch_conv_mnist.py:29:25
+  %conv1 : __torch__.torch.nn.modules.conv.___torch_mangle_52.Conv2d = prim::GetAttr[name="conv1"](%self)
+  %x.5 : Tensor = prim::CallMethod[name="forward"](%conv1, %x.1) # /home/lafiel/work/apex/dispenser/tests/test_torch_conv_mnist.py:23:8
+  %x.9 : Tensor = prim::CallFunction(%7, %x.5, %6) # /home/lafiel/work/apex/dispenser/tests/test_torch_conv_mnist.py:24:8
+  %conv2 : __torch__.torch.nn.modules.conv.___torch_mangle_53.Conv2d = prim::GetAttr[name="conv2"](%self)
+  %x.13 : Tensor = prim::CallMethod[name="forward"](%conv2, %x.9) # /home/lafiel/work/apex/dispenser/tests/test_torch_conv_mnist.py:25:8
+  %x.17 : Tensor = prim::CallFunction(%7, %x.13, %6) # /home/lafiel/work/apex/dispenser/tests/test_torch_conv_mnist.py:26:8
+  %18 : int[] = prim::ListConstruct(%17, %17)
+  %21 : int[] = prim::ListConstruct(%20, %20)
+  %23 : int[] = prim::ListConstruct(%32, %32)
+  %x.21 : Tensor = prim::CallFunction(%26, %x.17, %18, %19, %21, %23, %6, %6) # /home/lafiel/work/apex/dispenser/tests/test_torch_conv_mnist.py:27:8
+  %dropout1 : __torch__.torch.nn.modules.dropout.___torch_mangle_54.Dropout = prim::GetAttr[name="dropout1"](%self)
+  %x.25 : Tensor = prim::CallMethod[name="forward"](%dropout1, %x.21) # /home/lafiel/work/apex/dispenser/tests/test_torch_conv_mnist.py:28:8
+  %x.29 : Tensor = aten::flatten(%x.25, %32, %33) # /home/lafiel/work/apex/dispenser/tests/test_torch_conv_mnist.py:29:8
+  %fc1 : __torch__.torch.nn.modules.linear.___torch_mangle_56.Linear = prim::GetAttr[name="fc1"](%self)
+  %x.33 : Tensor = prim::CallMethod[name="forward"](%fc1, %x.29) # /home/lafiel/work/apex/dispenser/tests/test_torch_conv_mnist.py:30:8
+  %x.37 : Tensor = prim::CallFunction(%7, %x.33, %6) # /home/lafiel/work/apex/dispenser/tests/test_torch_conv_mnist.py:31:8
+  %dropout2 : __torch__.torch.nn.modules.dropout.___torch_mangle_55.Dropout = prim::GetAttr[name="dropout2"](%self)
+  %x.41 : Tensor = prim::CallMethod[name="forward"](%dropout2, %x.37) # /home/lafiel/work/apex/dispenser/tests/test_torch_conv_mnist.py:32:8
+  %fc2 : __torch__.torch.nn.modules.linear.___torch_mangle_57.Linear = prim::GetAttr[name="fc2"](%self)
+  %x.45 : Tensor = prim::CallMethod[name="forward"](%fc2, %x.41) # /home/lafiel/work/apex/dispenser/tests/test_torch_conv_mnist.py:33:8
+  %output.1 : Tensor = prim::CallFunction(%51, %x.45, %32, %49, %19) # /home/lafiel/work/apex/dispenser/tests/test_torch_conv_mnist.py:35:13
+  return (%output.1) </code></pre>
+      <p>The above is a high-lever representation of the data dependency relationships between different building blocks that can be further compiled by torch into any available backend, for example CUDA or CPU. Let's quickly dissect it.</p>
+      <p>Firstly, we notice all the variables declared as <code>%v.tag</code> where the tag is incremented with every use. This is <a href="">Static Single Assignment</a>, a representation method used by optimizing compilers that dictates each variable should only be declared once, similar to <a href="">register renaming</a> from the <a href="">last post</a>. It helps keep track of data dependencies and allows the compiler to do a wide range of optimizations including constant propagation, dead-code elimination, operator strength reduction, etc. This induces complications when mixed with control flow statements. Consider the following LLVM IR:</p>
+      <pre style="font-size:10px; border:none; background-color:#f6f6f6; border-radius:3px; padding: 10px 0px 10px 0px;"><code>    define demo( i1 %condition) {
+      %a.1 = alloca i32 ; allocate a 
+      br i1 %condition, label %true, label %false ; branch 
+    true:
+      <b>%a.1 = 420</b>  ; if condition, a = 420
+      br label %exit
+    false:
+      <b>%a.2 = 69</b>   ; if not condition, a = 69
+      br label %exit
+    exit:
+      ; decide value after branch 
+      <b>%a.final = phi i32 [ %a.1, %true ], [ %a.2, %false ]</b>
+      ret i32 %a.final 
+    } </pre></code>
+      <p>We need the \(\varphi\) (phi) function to decide the final return value of %a. If we come from <i>%true</i>, we pick the <i>%a.1</i> value, else we pick the <i>%a.2</i> value. You can find more about this in the original <a href="https://pages.cs.wisc.edu/~fischer/cs701.f14/ssa.pdf">SSE paper</a> or <a href="">LLVM documentation</a>. Using this, the JIT compiler goes through multiple passes of optimization. These stages are defined in <i>torch/csrc/jit/passes</i>. A quick before and after view of the IR modifications can be printed using the <i>PYTORCH_JIT_LOG_LEVEL</i> environment variable set to different pass names. Read more about it <a href="">here</a>. Below is a pass from <i>dead_code_elimination.cpp</i>:</p>
+      <pre style="font-size:10px; border:none; background-color:#f6f6f6; border-radius:3px;"><code>
+  After EliminateDeadCode: 
+  graph(%self.1 : Tensor,
+       %min.1 : Tensor?,
+       %max.1 : Tensor?):
+    %3 : NoneType = prim::Closure_0()
+    %117 : (Tensor?, Tensor?, Tensor) = prim::TupleConstruct(%min.1, %max.1, %self.1)
+    %118 : (NoneType, (Tensor?, Tensor?, Tensor)) = prim::TupleConstruct(%3, %117)
+    %83 : Tensor = aten::clamp(%self.1, %min.1, %max.1) # <string>:162:17
+    %84 : (Tensor, NoneType) = prim::TupleConstruct(%83, %118)
+    return (%84)
+
+  with prim::Closure_0 = graph(%context : (Tensor?, Tensor?, Tensor),
+        %grad_output.1 : Tensor):
+    %12 : bool = prim::Constant[value=0]() # <string>:151:15
+    %3 : NoneType = prim::Constant() # <string>:151:26
+    %min.1 : Tensor?, %max.1 : Tensor?, %self.1 : Tensor = prim::TupleUnpack(%context)
+    %4 : bool = aten::__isnot__(%min.1, %3) # <string>:151:15
+    %6 : bool, %min.35 : Tensor? = prim::If(%4) # <string>:151:15
+      block0():
+        %min.7 : Tensor = prim::unchecked_cast(%min.1)
+        %10 : bool = aten::__isnot__(%max.1, %3) # <string>:151:35
+        -> (%10, %min.7)
+      block1():
+        -> (%12, %min.1)
+    %15 : (Tensor, NoneType, NoneType) = prim::If(%6) # <string>:151:12
+      block0():
+        %min.13 : Tensor = prim::unchecked_cast(%min.35)
+        %max.7 : Tensor = prim::unchecked_cast(%max.1)
+        %18 : Tensor = aten::ge(%self.1, %min.13) # <string>:152:25
+        %20 : Tensor = aten::le(%self.1, %max.7) # <string>:152:41
+        %21 : Tensor = aten::mul(%18, %20) # <string>:152:25
+        %mask.1 : Tensor = aten::type_as(%21, %self.1) # <string>:152:25
+        %23 : Tensor = aten::mul(%grad_output.1, %mask.1) # <string>:153:23
+        %26 : (Tensor, NoneType, NoneType) = prim::TupleConstruct(%23, %3, %3)
+        -> (%26)
+      block1():
+        %28 : bool = aten::__isnot__(%min.35, %3) # <string>:154:17
+        %31 : (Tensor, NoneType, NoneType) = prim::If(%28) # <string>:154:17
+          block0():
+            %min.23 : Tensor = prim::unchecked_cast(%min.35)
+            %33 : Tensor = aten::ge(%self.1, %min.23) # <string>:155:24
+            %mask.5 : Tensor = aten::type_as(%33, %self.1) # <string>:155:24
+            %35 : Tensor = aten::mul(%grad_output.1, %mask.5) # <string>:156:23
+            %38 : (Tensor, NoneType, NoneType) = prim::TupleConstruct(%35, %3, %3)
+            -> (%38)
+          block1():
+            %40 : bool = aten::__isnot__(%max.1, %3) # <string>:157:17
+            %42 : (Tensor, NoneType, NoneType) = prim::If(%40) # <string>:157:17
+              block0():
+                %max.17 : Tensor = prim::unchecked_cast(%max.1)
+                %44 : Tensor = aten::le(%self.1, %max.17) # <string>:158:24
+                %mask.9 : Tensor = aten::type_as(%44, %self.1) # <string>:158:24
+                %46 : Tensor = aten::mul(%grad_output.1, %mask.9) # <string>:159:23
+                %49 : (Tensor, NoneType, NoneType) = prim::TupleConstruct(%46, %3, %3)
+                -> (%49)
+              block1():
+                %52 : (Tensor, NoneType, NoneType) = prim::TupleConstruct(%grad_output.1, %3, %3)
+                -> (%52)
+            -> (%42)
+        -> (%31)
+    return (%15)
+      </code></pre>
+      <p>There are 4 main structures - Graphs, Nodes, Blocks and Values. We can see the first graph definition takes in three different registers, <i>%self.1</i> of type <i>Tensor</i> and <i>%min.1, %max.1</i> of type <i>Tensor?</i>. The first operation is to instantiate the second <i>prim::Closure_0</i> graph in the <i>%3</i> register. This primitive is a representation of python <a href="https://mrevelle.blogspot.com/2006/10/closure-on-closures.html">closures</a> and takes a touple of three <i>Tensor</i>s as argument <i>%context</i>. In our case the values <i>%min.1, %max.1</i> and <i>%self.1</i> are given:</p>
+      <pre style="font-size:10px; border:none; background-color:#f6f6f6; border-radius:3px;"><code>
+  %3 : NoneType = prim::Closure_0()
+  %117 : (Tensor?, Tensor?, Tensor) = prim::TupleConstruct(%min.1, %max.1, %self.1)
+  %118 : (NoneType, (Tensor?, Tensor?, Tensor)) = prim::TupleConstruct(%3, %117)
+      </code></pre>
+      <p>Inside of the <i>prim::Closure</i> graph we ca see a couple <i>prim::If</i> conditional statements that split into two <i>block0()</i> if true and <i>block1()</i> if false. The condition given to the first one is a <i>aten::__isnot__</i> that checks if the <i>%min.1</i> tensor is of type <i>prim::Constant</i>.</p>
+      <pre style="font-size:10px; border:none; background-color:#f6f6f6; border-radius:3px;"><code>
+    %4 : bool = aten::__isnot__(%min.1, %3) # <string>:151:15
+    %6 : bool, %min.35 : Tensor? = prim::If(%4) # <string>:151:15
+      block0():
+        [ . . . ]
+        -> (%26)
+      block1():
+        %28 : bool = aten::__isnot__(%min.35, %3) # <string>:154:17
+        %31 : (Tensor, NoneType, NoneType) = prim::If(%28) # <string>:154:17
+          block0():
+            [ . . . ]
+            -> (%38)
+          block1():
+            %40 : bool = aten::__isnot__(%max.1, %3) # <string>:157:17
+            %42 : (Tensor, NoneType, NoneType) = prim::If(%40) # <string>:157:17
+            block0():
+              [ . . . ]
+              -> (%49)
+            block1():
+              [ . . . ] 
+              -> (%52)
+          -> (%42)
+      -> (%31)
+      </code></pre>
+
+
+      <p>Unfortunately for us, none of the graphing mechanisms or PyTorch support distributed structures. We can wrap this model in a FullyShardedDataParallel block. We get the following structure:</p>
+      <pre style="font-size:10px; border:none; background-color:#f6f6f6; border-radius:3px;"><code>   
+  FullyShardedDataParallel(
+    (_fsdp_wrapped_module): Net(
+      (conv1): Conv2d(1, 32, kernel_size=(3, 3), stride=(1, 1))
+      (conv2): Conv2d(32, 64, kernel_size=(3, 3), stride=(1, 1))
+      (dropout1): Dropout(p=0.25, inplace=False)
+      (dropout2): Dropout(p=0.5, inplace=False)
+      (fc1): Linear(in_features=9216, out_features=128, bias=True)
+      (fc2): Linear(in_features=128, out_features=10, bias=True)
+    )
+  ) </code></pre>
+      <p>Now all defined graphing mechanisms will skip the entire model. To evade this we will need to move to another flavor of IR, sprcifically HLO IR used by OpenXLA.</p>
+
+      <p>Check out the script dump of multi-headed attention <a target="_blank" href="https://gist.github.com/GandalfTea/61dc1454da6fcc8432fb181638b7b6d0">here</a>.</p>
+      <p>Current IR imposes a lot of restrictions. Let's look at another open source project aimed at generalizing one IR interface based on LLVM across different frameworks, MLIR. First, it's important to introduce the geometry behind a lot of the nested loop optimizations and affine transformations.</p>
+
+      <br /> <br />
+      <h4>3. Data Dependence Analysis in LLVM</h4>
+      <p>Current LLVM implementation of data dependency graph in <a href="">llvm/Analysis/DDG.h</a> implements algorithms from <a href="">Goff et al.</a> in <a href="">llvm/Analysis/DependenceAnalysis.h</a>. It separates the <i>indices</i>, temporary variables defined in the loop (<i>i, j, k</i>) and <i>subscripts</i>, positions of indices the data array takes in for different dimensions (<i>A[x][y]</i>). Consider the following loop nest:</p>
+      <pre><code>
+      for (int i=L1; i&lt;U1, i++) {
+        for (int j=L2; j&lt;U2, j++) {
+          for (int k=L3; k&lt;U3, k++) {
+            ...
+              for (int z=LN; z&lt;UN, z++) {
+                 A[ f1(i, j, k, ..., z), ..., fN(i, j, k, ..., z) ] =     (statement S1)
+                   A[ g1(i, j, k, ..., z), ..., gN(i, j, k, ..., z) ];    (statement S2)
+      </code></pre>
+      <p>Where \(f()\) and \(g()\) are restricted to <i>linear</i> functions over the indices.</p>
+      <p>Let \(\alpha\) and \(\beta\) be two vectors of \(N\) integer indices between the upper and lower bounds defined above. There exists a dependency from \(S_1\) to \(S_2\) in a nest of \(m\) loops iff \(\alpha\) is lexicographically less then or equal to \(\beta\) and the following system of dependence equations is satisfied: \[f_i(\alpha) = g_i(\beta) \quad \forall i, 1 \le i \lt m\]</p>
+      <p>We can define a <i>distance vector</i> \(D = (D_1, ..., D_n)\) that describes the data access patterns between loop iterations in the case of dependencies. Suppose there exists a dependency between \(\alpha\) and \(\beta\), we can then define \(D = \beta - \alpha\). Along with this, we can define a <i>directional vector</i> \(d = (d_1, ..., d_n)\) of the dependence as:</p>
+      <p>\[ d_i = \left\{ \begin{array}{ c l } 
+          \lt \quad \text{if} \quad \alpha_i \lt \beta_i \\ 
+          =   \quad \text{if} \quad \alpha_i = \beta_i \\
+          \gt \quad \text{if} \quad \alpha_i \gt \beta_i 
+      \end{array} \right.\]</p>
+      <p>For example, consider the following:</p>
+      <pre></code>
+      DO 10 i
+        DO 10 j
+          DO 10 k
+             A[i+1, j, k-1] = A[i, j, k] + C
+      </code></pre>
+      <p>The distance vector is \((1, 0, -1)\) and the directional vector is \((\lt, =, \gt)\). In addition, we define three types of complexities. A subscript is said to be <b>ZIV</b> (zero index variable) if it contains no index in either reference. It is said to be <b>SIV</b> (single index variable) if it only contains one index and <b>MIV</b> (multiple index variable) if it contains more then one index. As an example consider:</p>
+      <pre></code>
+      DO 10 i
+        DO 10 j
+          DO 10 k
+             A[5, i+1, j] = A[N, i, k] + C
+      </code></pre>
+      <p>The first subscript \((5,N)\) is <b>ZIV</b>, second \((i+1,i)\) is <b>SIV</b> and third \((j,k)\) is <b>MIV</b>. The paper does not consider output dependencies.</p>
+      <p>Another property we can derrive is <i>separability</i>. We can say a subscript position is <i>separable</i> if it's indices do not exist in other subscripts. Consider the following example:</p>
+      <pre></code>
+      DO 10 i
+        DO 10 j
+          DO 10 k
+             A[i, j, j] = A[i, j, k] + C
+      </code></pre>
+      <p>The first subscript \((i, i)\) is separable but the second \((j, j)\) and third \((j, k)\) are <i>coupled</i> because they both contain \(j\). This property is important because multidimensional array references can cause imprecisions when testing for dependencies.</p>
+      <p>In order to test for dependence, we can define a <i>Partifition-Based Algorithm</i> by separating each subscript and testing independently. The steps are:</p>
+      <ol type="i">
+        <li>Partition the subscripts into separable and minimal <i>coupled groups</i>.</li>
+        <li>Label each subscript as <b>ZIV</b>, <b>SIV</b> or <b>MIV</b>.</li>
+        <li>Apply a dependence test based on the complexity. This will result in either <i>dependent</i> or <i>independent</i> subscripts.</li>
+        <li>For each group, apply a multiple-subscript test and produce a set of directional vectors for indices in that group.</li>
+        <li>If any test yields <i>independent</i>, no dependence exists.</li>
+      </ol>
+      <br />
+      <p>A group is <i>minimal</i> if it cannot be split into two non-empty subgroups with distinct sets of indices. The following algorithm can be used to split into the partitions:</i>
+      <p>
+      <b>Input:</b> A pair of \(m\)-dimansional arrays containing subcripts \(S_1 \dots S_m\). <br />
+      <b>Output:</b> A set of minimal group \(P_1 \dots P_{n'}\), \(n' \le n\). <br />
+      </p>
+      <div style="background-color: #f6f6f6; border-radius: 5px; padding: 10px 10px 10px 40px;">
+      <b>for</b> each \(i, 1 \le i \le n\) <b>do</b> <br />
+      \(\quad k \leftarrow (none)\) <br />
+      \(\quad\)<b>for</b> each remaining partition \(P_j\) <b>do</b> <br />
+      \(\quad\quad\)<b>if</b> \(\exists S_l \in P_j\) such that \(S_l\) contains \(I_i\) <b>then</b> <br />
+      \(\quad\quad\quad\)<b>if</b> \( k = (none)\) <b>then</b> <br />
+      \(\quad\quad\quad\quad k \leftarrow j\) <br />
+      \(\quad\quad\quad\)<b>else</b> <br />
+      \(\quad\quad\quad\quad P_k \leftarrow \text{merge}(P_k, P_j)\) <br />
+      \(\quad\quad\quad\)<b>endif</b> <br />
+      \(\quad\quad\)<b>endif</b> <br />
+      \(\quad\)<b>endfor</b> <br />
+      <b>endfor</b> <br />
+      </div>
+      <p>Since each group contains a unique subset of indices, the <i>merge</i> operation can be thought of as a Cartesian product. For example, consider:</p> 
+      <pre></code>
+      DO 10 i
+        DO 10 j
+           A[i+5, j] = A[i, j] + C
+      </code></pre>
+      <p>The first subscript \(i\) yields the directional vector \((\lt)\). The second subscript \(j\) yields \((=)\). The resulting Cartesian product is the single vector \((\lt, =)\).</p>
+      <p>To each of the groups, we apply the following tests. For the <b>ZIV</b> dependence takes two loop0invariant expressions. If the system can prove the two expressions cannot be equal, it has proven independence. Otherwise, this subscript does not contribute any directional vectors and will be ignored. A simple symbolic method for this test is to take the difference between the two subscripts. If the different simplifies to a non-zero constant, it is independent</p>
+      <p>There are two types of <b>SIV</b> test:</p>
+      <ol type="i">
+        <li>A SIV subscript is said to be <b>strong</b> if it has the form \(ai+c_1, ai' + c_2\), it is linear and the coefficients of the occurances of the index are constant and equal. Given this, we define the <i>dependence distant</i> as:
+            \[d = i' - i = \frac{c_1 - c_2}{a}\]
+            and say a dependence exists iff \(d\) is an integer and \(|d| \le U - L\) where \(U\) and \(L\) are the upper and lower bounds of the loop. If there exists a dependence, the <i>direction</i> is given by:
+            \[ d_i = \left\{ \begin{array}{ c l } 
+                \lt \quad \text{if} \quad \alpha_i \lt \beta_i \\ 
+                =   \quad \text{if} \quad \alpha_i = \beta_i \\
+                \gt \quad \text{if} \quad \alpha_i \gt \beta_i 
+            \end{array} \right.\]
+          </li> <br />
+          <li>A SIV subscript is said to be <b>weak</b> if it has the form \(a_1i+c_1, a_2i'+c_2\), where the coefficients have different constant values. This could be solved using the <i>Single-Index</i> exact test. However, we could also look at this form geometrically, where the equation describes a line in the two dimensional pane with axes \(i\) and \(i'\). The test can then be formulated to determine whether the line intersects with any integer points in the space bounded by the loop upper and lower bounds. Here again we find two different cases:</li>
+            <br />
+            <ol type="a">
+              <li>A weak SIV subscript is said to be <b>weak-zero</b> if \(a_1 = 0\) or \(a_2 = 0\). If the \(a_2\) is zero the equation reduces to:
+                \[ i = \frac{c_2 - c_1}{a_1} \] 
+                We simply need to check if the resulting value \(i\) is an integer and withing the loop bounds. The case of \(a_1\) being zero is similar.
+                </li>
+            </ol>
+          </li>
+      </ol>
+
+
+
+      <br /> <br />
+      <h4>3. Polyhedral loop optimizations</h4>
+      <br /> <br />
+      <h4>3. SOTA</h4>
+      <p>in <a href="https://arxiv.org/pdf/2402.15627" target="_blank">[2402.15627]</a> the authors employed the following optimizations:</p>
+      <ol type="i">
+        <li><b>parallel transformer blocks</b> <a href="https://arxiv.org/pdf/2305.19370" target="_blank">[2305.19370]</a> leveraging associativity and reformulating the transformer formula into a form that can be executed in parallel (e.g. multi-threading): \[ y = x + \text{MLP}(\text{LN}(x)) + \text{Attention}(\text{LN}(x)) \]</li>
+        <li><b>sliding window attention</b> <a href="https://arxiv.org/pdf/2004.05150" target="_blank">[2004.05150]</a> imploying a sparse-attention mechanism by effectively transforming it into a convolution</li>
+        <li><b>LAMB optimizer</b> <a href="">[]</a></li>
+      </ol>
+      scheduling of overlapping operations and communications:
+      <ol type="i">
+        <li></li>
+      </ol>
+
+      <p>in <a href="">[2004.13336]</a> the authors surprisingly stopped playing Genshin Impact for a small amount of time and trained a distributed network.</p>
+      <p>
+    </main>
+  </body>
+</html>
